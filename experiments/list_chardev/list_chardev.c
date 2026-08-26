@@ -4,29 +4,66 @@
 #include <linux/init.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/slab.h>
 // #include <linux/list.h>
 
+#include <asm/errno.h>
+
 #define DRIVER_NAME "list_dev"
+
+// struct buf_node {
+// 	size_t size;
+// 	char *buf;
+// 	struct list_head node;
+// };
 
 static int major;
 static struct cdev list_dev;
 static struct class *cls;
+// struct buf_node buf_list;
+static char *kbuf = NULL;
+static size_t kbuf_size = 0;
 
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
 	printk("list_dev_read() called\n");
-	return 0;
+
+	if (*f_pos >= kbuf_size) {
+		*f_pos = 0;
+		return 0;
+	}
+
+	unsigned long copy_size = min(kbuf_size - *f_pos, count);
+	if (copy_to_user(buf, kbuf, copy_size))
+		return -EFAULT;
+
+	*f_pos += copy_size;
+
+	return copy_size;
 }
 
 static ssize_t list_dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
 	printk("list_dev_write() called\n");
-	return count;
+
+	if (kbuf)
+		kfree(kbuf);
+
+	kbuf = kmalloc(count, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	kbuf_size = count;
+
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+
+	return count; // is this guaranteed to be safe?
 }
 
 static int list_dev_open(struct inode *inode, struct file *filp)
 {
-	printk("list_dev_release() called\n");
+	printk("list_dev_open() called\n");
 	return 0;
 }
 
@@ -50,6 +87,7 @@ static int __init list_dev_init(void)
 	int ret = 0;
 
 	printk("initializing %s ...\n", DRIVER_NAME);
+
 	// alloc_chrdev_region()
 	// returns major number + first minor number in dev
 	// second argument = base minor
