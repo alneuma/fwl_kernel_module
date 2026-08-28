@@ -227,6 +227,8 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 {
 	printk("list_dev_release: called\n");
 
+	printk("lcd_append_word: filp->private_data = %p\n", filp->private_data);
+
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
 	if (lcd_append_word(filp->private_data, NULL, 0))
