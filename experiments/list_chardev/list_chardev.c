@@ -35,14 +35,12 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 
 	struct lcd_word_node *e;
 	struct list_head *cur;
-	char sep = '\0';
 	size_t num_nodes = 0;
 	list_for_each(cur, &word_list) {
 		++num_nodes;
 		e = list_entry(cur, struct lcd_word_node, list);
 		// unsafe cast to (int)
-		printk("%c%.*s", sep, (int)e->word.len, e->word.word);
-		sep = ' ';
+		printk("%lu bytes: %.*s", e->word.len, (int)e->word.len, e->word.word);
 	}
 	printk("%lu nodes\n", num_nodes);
 	return 0;
