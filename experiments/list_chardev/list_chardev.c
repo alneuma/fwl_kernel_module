@@ -32,19 +32,14 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 			     loff_t *f_pos)
 {
 	printk("list_dev_read() called\n");
-	//
-	// if (*f_pos >= kbuf_size) {
-	// 	*f_pos = 0;
-	// 	return 0;
-	// }
-	//
-	// unsigned long copy_size = min(kbuf_size - *f_pos, count);
-	// if (copy_to_user(buf, kbuf, copy_size))
-	// 	return -EFAULT;
-	//
-	// *f_pos += copy_size;
-	//
-	// return copy_size;
+
+	struct lcd_word_node *e;
+	struct list_head *cur;
+	list_for_each(cur, &word_list) {
+		e = list_entry(cur, struct lcd_word_node, list);
+		// unsafe cast to (int)
+		printk("buf: %.*s\n", (int)e->word.len, e->word.word);
+	}
 	return 0;
 }
 
@@ -74,12 +69,12 @@ static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 	size_t total_len;
 	size_t idx;
 
-	if (!word && !prefix)
-		return 0;
-
 	total_len = len;
 	if (prefix)
 		total_len += prefix->len;
+
+	if (!total_len)
+		return 0;
 
 	struct lcd_word_node *new_node =
 		kmalloc(sizeof(*new_node) + total_len, GFP_KERNEL);
