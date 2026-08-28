@@ -72,6 +72,8 @@ static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 	size_t total_len;
 	size_t idx;
 
+	printk("lcd_append_word: prefix = %p\n", prefix);
+
 	total_len = len;
 	if (prefix)
 		total_len += prefix->len;
