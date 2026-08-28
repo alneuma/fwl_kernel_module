@@ -210,6 +210,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	if (ret)
 		return ret;
 	// end of mutex(?) protection
+	printk("list_dev_write: filp->private_data = %p\n", filp->private_data);
 
 	return copy_size;
 }
