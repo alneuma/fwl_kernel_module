@@ -10,6 +10,7 @@
 #include <asm/errno.h>
 
 #define DRIVER_NAME "list_dev"
+#define DEVBUF_SIZE 1024
 
 // struct buf_node {
 // 	size_t size;
@@ -21,44 +22,53 @@ static int major;
 static struct cdev list_dev;
 static struct class *cls;
 // struct buf_node buf_list;
-static char *kbuf = NULL;
-static size_t kbuf_size = 0;
+static char devbuf[DEVBUF_SIZE];
 
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
 	printk("list_dev_read() called\n");
+	//
+	// if (*f_pos >= kbuf_size) {
+	// 	*f_pos = 0;
+	// 	return 0;
+	// }
+	//
+	// unsigned long copy_size = min(kbuf_size - *f_pos, count);
+	// if (copy_to_user(buf, kbuf, copy_size))
+	// 	return -EFAULT;
+	//
+	// *f_pos += copy_size;
+	//
+	// return copy_size;
+	return 0;
+}
 
-	if (*f_pos >= kbuf_size) {
-		*f_pos = 0;
-		return 0;
-	}
-
-	unsigned long copy_size = min(kbuf_size - *f_pos, count);
-	if (copy_to_user(buf, kbuf, copy_size))
-		return -EFAULT;
-
-	*f_pos += copy_size;
-
-	return copy_size;
+static int save_words(struct file *filp, const char *buf, const size_t buf_size)
+{
+	// save words to list
+	// save last section that does not contain any whitespace to
+	// filp->private_data
+	return 0;
 }
 
 static ssize_t list_dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
+	size_t copy_size;
+	int ret;
+
 	printk("list_dev_write() called\n");
 
-	if (kbuf)
-		kfree(kbuf);
+	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
 
-	kbuf = kmalloc(count, GFP_KERNEL);
-	if (!kbuf)
-		return -ENOMEM;
+	// needs to be mutex(?) protected
+	if (copy_from_user(devbuf, buf, copy_size))
+	 	return -EFAULT;
 
-	kbuf_size = count;
-
-	if (copy_from_user(kbuf, buf, count))
-		return -EFAULT;
-
-	return count; // is this guaranteed to be safe?
+	ret = save_words(filp, buf, copy_size);
+	if (ret)
+		return ret;
+	
+	return copy_size;
 }
 
 static int list_dev_open(struct inode *inode, struct file *filp)
@@ -115,6 +125,7 @@ static int __init list_dev_init(void)
 		       DRIVER_NAME, ret);
 		goto class_create_failed;
 	}
+
 
 	struct device *retp = device_create(cls, NULL, devt, NULL, DRIVER_NAME);
 	if (IS_ERR(retp)) {
