@@ -125,6 +125,10 @@ static int lcd_save_residue(struct file *filp, const char *res,
 		//edgecase: there still is residue
 	}
 
+	printk("lcd_save_residue: stash = %p\n", stash);
+	printk("lcd_save_residue: stash->len = %lu\n", stash->len);
+	printk("lcd_save_residue: stash->word = %.*s", (int)stash->len, stash->word);
+
 	return 0;
 }
 
@@ -186,6 +190,10 @@ static int save_words(struct file *filp, const char *buf, const size_t buf_size)
 
 	if (state != NO_WORD)
 		ret = lcd_save_residue(filp, buf + wstart, buf_size - wstart);
+	struct lcd_word *stash = filp->private_data;
+	printk("lcd_save_word: stash = %p\n", stash);
+	printk("lcd_save_word: stash->len = %lu\n", stash->len);
+	printk("lcd_save_word: stash->word = %.*s", (int)stash->len, stash->word);
 
 	return ret;
 }
