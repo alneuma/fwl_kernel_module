@@ -35,10 +35,12 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 
 	struct lcd_word_node *e;
 	struct list_head *cur;
+	char sep = '\0';
 	list_for_each(cur, &word_list) {
 		e = list_entry(cur, struct lcd_word_node, list);
 		// unsafe cast to (int)
-		printk("buf: %.*s\n", (int)e->word.len, e->word.word);
+		printk("%c%.*s", sep, (int)e->word.len, e->word.word);
+		sep = ' ';
 	}
 	return 0;
 }
@@ -66,6 +68,7 @@ static int lcd_isspace(const char c)
 static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 			   const size_t len)
 {
+	printk("lcd_append_word called\n");
 	size_t total_len;
 	size_t idx;
 
@@ -73,6 +76,7 @@ static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 	if (prefix)
 		total_len += prefix->len;
 
+	printk("lcd_append_word: total len = %lu\n", total_len);
 	if (!total_len)
 		return 0;
 
