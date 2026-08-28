@@ -111,9 +111,9 @@ static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 static int lcd_save_residue(struct file *filp, const char *res,
 			    const size_t len)
 {
-	struct lcd_word *stash = filp->private_data;
+	struct lcd_word *stash = NULL;
 
-	if (stash == NULL) {
+	if (!filp->private_data) {
 		stash = kmalloc(sizeof(*stash) + len, GFP_KERNEL);
 		if (!stash)
 			return -ENOMEM;
@@ -128,6 +128,8 @@ static int lcd_save_residue(struct file *filp, const char *res,
 	printk("lcd_save_residue: stash = %p\n", stash);
 	printk("lcd_save_residue: stash->len = %lu\n", stash->len);
 	printk("lcd_save_residue: stash->word = %.*s", (int)stash->len, stash->word);
+
+	filp->private_data = stash;
 
 	return 0;
 }
