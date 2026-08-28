@@ -31,7 +31,7 @@ static char devbuf[DEVBUF_SIZE];
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 			     loff_t *f_pos)
 {
-	printk("list_dev_read() called\n");
+	printk("list_dev_read: called\n");
 
 	struct lcd_word_node *e;
 	struct list_head *cur;
@@ -71,7 +71,7 @@ static int lcd_isspace(const char c)
 static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 			   const size_t len)
 {
-	printk("lcd_append_word called\n");
+	printk("lcd_append_word: called\n");
 	size_t total_len;
 	size_t idx;
 
@@ -196,7 +196,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	size_t copy_size;
 	int ret;
 
-	printk("list_dev_write() called\n");
+	printk("list_dev_write: called\n");
 
 	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
 
@@ -216,7 +216,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 
 static int list_dev_open(struct inode *inode, struct file *filp)
 {
-	printk("list_dev_open() called\n");
+	printk("list_dev_open: called\n");
 
 	filp->private_data = NULL;
 
@@ -225,7 +225,7 @@ static int list_dev_open(struct inode *inode, struct file *filp)
 
 static int list_dev_release(struct inode *inode, struct file *filp)
 {
-	printk("list_dev_release() called\n");
+	printk("list_dev_release: called\n");
 
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
