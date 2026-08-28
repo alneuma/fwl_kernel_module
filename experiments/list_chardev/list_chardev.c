@@ -94,6 +94,8 @@ static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 
 	list_add_tail(&new_node->list, &word_list);
 
+	printk("lcd_append_word: appended word\n");
+
 	return 0;
 }
 
@@ -109,6 +111,7 @@ static int lcd_save_residue(struct file *filp, const char *res,
 
 		memcpy(stash->word, res, len);
 		stash->len = len;
+		printk("lcd_save_residue: saved %ld bytes in file struct\n", len);
 	} else {
 		//edgecase: there still is residue
 	}
@@ -192,6 +195,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	// should be one writer or any number of readers
 	if (copy_from_user(devbuf, buf, copy_size))
 		return -EFAULT;
+	printk("list_dev_write: copied %lu bytes to buffer\n", copy_size);
 
 	ret = save_words(filp, buf, copy_size);
 	if (ret)
