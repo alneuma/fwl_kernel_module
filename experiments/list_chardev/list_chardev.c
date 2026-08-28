@@ -5,23 +5,27 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/slab.h>
-// #include <linux/list.h>
+#include <linux/list.h>
 
 #include <asm/errno.h>
 
 #define DRIVER_NAME "list_dev"
 #define DEVBUF_SIZE 1024
 
-// struct buf_node {
-// 	size_t size;
-// 	char *buf;
-// 	struct list_head node;
-// };
+struct lcd_word {
+	size_t len;
+	char word[];
+};
+
+struct lcd_word_node {
+	struct list_head list;
+	struct lcd_word word;
+};
 
 static int major;
 static struct cdev list_dev;
 static struct class *cls;
-// struct buf_node buf_list;
+LIST_HEAD(word_list);
 static char devbuf[DEVBUF_SIZE];
 
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
@@ -43,11 +47,70 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count, 
 	return 0;
 }
 
+static int lcd_isspace(const char c)
+{
+	return c == ' ';
+}
+
+static int lcd_append_word(const struct lcd_word *prefix, const char *word, const size_t len)
+{
+	// if prefix == NULL
+	// if prefix != NULL
+	// if word == NULL
+	// if word != NULL
+	struct lcd_word_node *new_node = kmalloc(sizeof(*new_node) + len, GFP_KERNEL);
+	if (!new_node)
+		return -ENOMEM;
+
+	memcpy(new_node->word.word, word, len);
+	new_node->word.len = len;
+	list_add_tail(&new_node->list, &word_list);
+
+	return 0;
+}
+
+static int lcd_save_residue(struct file *filp, const char *res, const size_t len)
+{
+	struct lcd_word *stash = filp->private_data;
+
+	if (stash == NULL) {
+		stash = kmalloc(sizeof(*stash) + len, GFP_KERNEL);
+		if (!stash)
+			return -ENOMEM;
+
+		memcpy(stash->word, res, len);
+		stash->len = len;
+	} else {
+		//edgecase: there still is residue
+	}
+
+	return 0;
+}
+
 static int save_words(struct file *filp, const char *buf, const size_t buf_size)
 {
-	// save words to list
-	// save last section that does not contain any whitespace to
-	// filp->private_data
+	size_t wstart = 0;
+	size_t wend = 0;
+
+	while (wstart < buf_size && lcd_isspace(buf[wstart]))
+		++wstart;
+
+	while (wstart != buf_size) {
+
+		wend = wstart + 1;
+		while (wend < buf_size && !lcd_isspace(buf[wend]))
+			++wend;
+
+		if (wend == buf_size - wstart)
+			return lcd_save_residue(filp, buf + wstart, buf_size - wstart);
+
+		if (lcd_append_word(filp->private_data, buf + wstart, wend - wstart))
+			return -ENOMEM;
+
+		while (wstart < buf_size && lcd_isspace(buf[wstart]))
+			++wstart;
+	}
+
 	return 0;
 }
 
@@ -60,13 +123,15 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf, size_t 
 
 	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
 
-	// needs to be mutex(?) protected
+	// start of mutex(?) protection
+	// should be one writer or any number of readers
 	if (copy_from_user(devbuf, buf, copy_size))
 	 	return -EFAULT;
 
 	ret = save_words(filp, buf, copy_size);
 	if (ret)
 		return ret;
+	// end of mutex(?) protection
 	
 	return copy_size;
 }
@@ -74,12 +139,22 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf, size_t 
 static int list_dev_open(struct inode *inode, struct file *filp)
 {
 	printk("list_dev_open() called\n");
+
+	filp->private_data = NULL;
+
 	return 0;
 }
 
 static int list_dev_release(struct inode *inode, struct file *filp)
 {
 	printk("list_dev_release() called\n");
+
+	// start of mutex(?) protection
+	// should be one writer or any number of readers
+	if (lcd_append_word(filp->private_data, NULL, 0))
+		return -ENOMEM;
+	// end of mutex(?) protection
+
 	return 0;
 }
 
