@@ -197,7 +197,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 		return -EFAULT;
 	printk("list_dev_write: copied %lu bytes to buffer\n", copy_size);
 
-	ret = save_words(filp, buf, copy_size);
+	ret = save_words(filp, devbuf, copy_size);
 	if (ret)
 		return ret;
 	// end of mutex(?) protection
