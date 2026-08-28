@@ -28,7 +28,8 @@ static struct class *cls;
 LIST_HEAD(word_list);
 static char devbuf[DEVBUF_SIZE];
 
-static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
+			     loff_t *f_pos)
 {
 	printk("list_dev_read() called\n");
 	//
@@ -52,24 +53,57 @@ static int lcd_isspace(const char c)
 	return c == ' ';
 }
 
-static int lcd_append_word(const struct lcd_word *prefix, const char *word, const size_t len)
+// lcd_append_word()
+//
+// must be within mutex protected region
+//
+// if prefix != NULL
+// appends word with prefix
+//
+// if prefix == NULL
+// appends word
+//
+// if word == NULL
+// only appends prefix
+//
+// if word == NULL && prefix == NULL
+// does nothing
+static int lcd_append_word(const struct lcd_word *prefix, const char *word,
+			   const size_t len)
 {
-	// if prefix == NULL
-	// if prefix != NULL
-	// if word == NULL
-	// if word != NULL
-	struct lcd_word_node *new_node = kmalloc(sizeof(*new_node) + len, GFP_KERNEL);
+	size_t total_len;
+	size_t idx;
+
+	if (!word && !prefix)
+		return 0;
+
+	total_len = len;
+	if (prefix)
+		total_len += prefix->len;
+
+	struct lcd_word_node *new_node =
+		kmalloc(sizeof(*new_node) + total_len, GFP_KERNEL);
 	if (!new_node)
 		return -ENOMEM;
 
-	memcpy(new_node->word.word, word, len);
-	new_node->word.len = len;
+	new_node->word.len = total_len;
+
+	idx = 0;
+	if (prefix) {
+		memcpy(new_node->word.word, prefix->word, prefix->len);
+		idx += prefix->len;
+	}
+
+	if (word)
+		memcpy(new_node->word.word + idx, word, len);
+
 	list_add_tail(&new_node->list, &word_list);
 
 	return 0;
 }
 
-static int lcd_save_residue(struct file *filp, const char *res, const size_t len)
+static int lcd_save_residue(struct file *filp, const char *res,
+			    const size_t len)
 {
 	struct lcd_word *stash = filp->private_data;
 
@@ -87,34 +121,70 @@ static int lcd_save_residue(struct file *filp, const char *res, const size_t len
 	return 0;
 }
 
+// save_words()
+//
+// must be within mutex protected region
+//
 static int save_words(struct file *filp, const char *buf, const size_t buf_size)
 {
+	enum parse_state {
+		WORD_RES,
+		WORD_NO_RES,
+		NO_WORD,
+	};
+
+	size_t idx = 0;
 	size_t wstart = 0;
-	size_t wend = 0;
+	int ret = 0;
+	enum parse_state state = WORD_RES;
+	int idx_space = lcd_isspace(buf[idx]);
 
-	while (wstart < buf_size && lcd_isspace(buf[wstart]))
-		++wstart;
-
-	while (wstart != buf_size) {
-
-		wend = wstart + 1;
-		while (wend < buf_size && !lcd_isspace(buf[wend]))
-			++wend;
-
-		if (wend == buf_size - wstart)
-			return lcd_save_residue(filp, buf + wstart, buf_size - wstart);
-
-		if (lcd_append_word(filp->private_data, buf + wstart, wend - wstart))
-			return -ENOMEM;
-
-		while (wstart < buf_size && lcd_isspace(buf[wstart]))
-			++wstart;
+	if (idx_space) {
+		ret = lcd_append_word(filp->private_data, NULL, 0);
+		kfree(filp->private_data);
+		filp->private_data = NULL;
+		if (ret)
+			return ret;
+		++idx;
+		state = NO_WORD;
 	}
 
-	return 0;
+	while (idx != buf_size) {
+		if (state == WORD_RES && idx_space) {
+			ret = lcd_append_word(filp->private_data,
+					      buf + wstart,
+					      idx - wstart);
+			kfree(filp->private_data);
+			filp->private_data = NULL;
+			if (ret)
+				break;
+			state = NO_WORD;
+		}
+		else if (state == WORD_NO_RES && idx_space) {
+			ret = lcd_append_word(filp->private_data,
+					      buf + wstart,
+					      idx - wstart);
+			if (ret)
+				break;
+			state = NO_WORD;
+		}
+		else if (state == NO_WORD && !idx_space) {
+			wstart = idx;
+			state = WORD_NO_RES;
+		}
+
+		++idx;
+		idx_space = lcd_isspace(buf[idx]);
+	}
+
+	if (state != NO_WORD)
+		ret = lcd_save_residue(filp, buf + wstart, buf_size - wstart);
+
+	return ret;
 }
 
-static ssize_t list_dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t list_dev_write(struct file *filp, const char __user *buf,
+			      size_t count, loff_t *f_pos)
 {
 	size_t copy_size;
 	int ret;
@@ -126,13 +196,13 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf, size_t 
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
 	if (copy_from_user(devbuf, buf, copy_size))
-	 	return -EFAULT;
+		return -EFAULT;
 
 	ret = save_words(filp, buf, copy_size);
 	if (ret)
 		return ret;
 	// end of mutex(?) protection
-	
+
 	return copy_size;
 }
 
@@ -159,11 +229,11 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 }
 
 static struct file_operations list_dev_ops = {
-    .owner = THIS_MODULE,
-    .open = list_dev_open,
-    .release = list_dev_release,
-    .read = list_dev_read,
-    .write = list_dev_write,
+	.owner = THIS_MODULE,
+	.open = list_dev_open,
+	.release = list_dev_release,
+	.read = list_dev_read,
+	.write = list_dev_write,
 };
 
 static int __init list_dev_init(void)
@@ -188,8 +258,8 @@ static int __init list_dev_init(void)
 	cdev_init(&list_dev, &list_dev_ops);
 	ret = cdev_add(&list_dev, devt, 1); // add one device
 	if (ret) {
-		printk("failed to initialize %s: cdev_add(): %d",
-		       DRIVER_NAME, ret);
+		printk("failed to initialize %s: cdev_add(): %d", DRIVER_NAME,
+		       ret);
 		goto cdev_add_failed;
 	}
 
@@ -200,7 +270,6 @@ static int __init list_dev_init(void)
 		       DRIVER_NAME, ret);
 		goto class_create_failed;
 	}
-
 
 	struct device *retp = device_create(cls, NULL, devt, NULL, DRIVER_NAME);
 	if (IS_ERR(retp)) {
