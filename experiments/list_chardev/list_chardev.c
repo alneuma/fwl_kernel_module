@@ -170,8 +170,9 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
-	list_add_tail(&((struct lcd_word *)(filp->private_data))->node,
-		      &word_list);
+	if (filp->private_data)
+		list_add_tail(&((struct lcd_word *)(filp->private_data))->node,
+			      &word_list);
 	// end of mutex(?) protection
 
 	filp->private_data = NULL;
