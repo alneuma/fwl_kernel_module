@@ -166,7 +166,6 @@ static int list_dev_open(struct inode *inode, struct file *filp)
 static int list_dev_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
-	lcd_log_list();
 
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
