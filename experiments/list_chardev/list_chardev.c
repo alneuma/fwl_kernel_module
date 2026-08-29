@@ -243,6 +243,8 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 	// should be one writer or any number of readers
 	if (lcd_append_word(filp->private_data, NULL, 0))
 		return -ENOMEM;
+	kfree(filp->private_data);
+	filp->private_data = NULL;
 	// end of mutex(?) protection
 
 	return 0;
