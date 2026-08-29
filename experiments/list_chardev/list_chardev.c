@@ -1,3 +1,5 @@
+#define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/printk.h>
@@ -31,7 +33,7 @@ static char devbuf[DEVBUF_SIZE];
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 			     loff_t *f_pos)
 {
-	printk("list_dev_read: called\n");
+	pr_debug("called\n");
 
 	struct lcd_word_node *e;
 	struct list_head *cur;
@@ -40,9 +42,8 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 		++num_nodes;
 		e = list_entry(cur, struct lcd_word_node, list);
 		// unsafe cast to (int)
-		printk("%lu bytes: %.*s", e->word.len, (int)e->word.len, e->word.word);
+		printk("%s: node %lu: %.*s", DRIVER_NAME, num_nodes, (int)e->word.len, e->word.word);
 	}
-	printk("%lu nodes\n", num_nodes);
 	return 0;
 }
 
@@ -69,17 +70,17 @@ static int lcd_isspace(const char c)
 static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 			   const size_t len)
 {
-	printk("lcd_append_word: called\n");
+	pr_debug("called\n");
 	size_t total_len;
 	size_t idx;
 
-	printk("lcd_append_word: prefix = %p\n", prefix);
+	pr_debug("prefix = %p\n", prefix);
 
 	total_len = len;
 	if (prefix)
 		total_len += prefix->len;
 
-	printk("lcd_append_word: total len = %lu\n", total_len);
+	pr_debug("total len = %lu\n", total_len);
 	if (!total_len)
 		return 0;
 
@@ -101,7 +102,7 @@ static int lcd_append_word(const struct lcd_word *prefix, const char *word,
 
 	list_add_tail(&new_node->list, &word_list);
 
-	printk("lcd_append_word: appended word\n");
+	pr_debug("appended word\n");
 
 	return 0;
 }
@@ -118,14 +119,14 @@ static int lcd_save_residue(struct file *filp, const char *res,
 
 		memcpy(stash->word, res, len);
 		stash->len = len;
-		printk("lcd_save_residue: saved %ld bytes in file struct\n", len);
+		pr_debug("saved %ld bytes in file struct\n", len);
 	} else {
 		//edgecase: there still is residue
 	}
 
-	printk("lcd_save_residue: stash = %p\n", stash);
-	printk("lcd_save_residue: stash->len = %lu\n", stash->len);
-	printk("lcd_save_residue: stash->word = %.*s", (int)stash->len, stash->word);
+	pr_debug("stash = %p\n", stash);
+	pr_debug("stash->len = %lu\n", stash->len);
+	pr_debug("stash->word = %.*s", (int)stash->len, stash->word);
 
 	filp->private_data = stash;
 
@@ -191,9 +192,9 @@ static int save_words(struct file *filp, const char *buf, const size_t buf_size)
 	if (state != NO_WORD)
 		ret = lcd_save_residue(filp, buf + wstart, buf_size - wstart);
 	struct lcd_word *stash = filp->private_data;
-	printk("lcd_save_word: stash = %p\n", stash);
-	printk("lcd_save_word: stash->len = %lu\n", stash->len);
-	printk("lcd_save_word: stash->word = %.*s", (int)stash->len, stash->word);
+	pr_debug("stash = %p\n", stash);
+	pr_debug("stash->len = %lu\n", stash->len);
+	pr_debug("stash->word = %.*s", (int)stash->len, stash->word);
 
 	return ret;
 }
@@ -204,7 +205,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	size_t copy_size;
 	int ret;
 
-	printk("list_dev_write: called\n");
+	pr_debug("called\n");
 
 	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
 
@@ -212,20 +213,20 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	// should be one writer or any number of readers
 	if (copy_from_user(devbuf, buf, copy_size))
 		return -EFAULT;
-	printk("list_dev_write: copied %lu bytes to buffer\n", copy_size);
+	pr_debug("copied %lu bytes to buffer\n", copy_size);
 
 	ret = save_words(filp, devbuf, copy_size);
 	if (ret)
 		return ret;
 	// end of mutex(?) protection
-	printk("list_dev_write: filp->private_data = %p\n", filp->private_data);
+	pr_debug("filp->private_data = %p\n", filp->private_data);
 
 	return copy_size;
 }
 
 static int list_dev_open(struct inode *inode, struct file *filp)
 {
-	printk("list_dev_open: called\n");
+	pr_debug("called\n");
 
 	filp->private_data = NULL;
 
@@ -234,9 +235,9 @@ static int list_dev_open(struct inode *inode, struct file *filp)
 
 static int list_dev_release(struct inode *inode, struct file *filp)
 {
-	printk("list_dev_release: called\n");
+	pr_debug("called\n");
 
-	printk("lcd_append_word: filp->private_data = %p\n", filp->private_data);
+	pr_debug("filp->private_data = %p\n", filp->private_data);
 
 	// start of mutex(?) protection
 	// should be one writer or any number of readers

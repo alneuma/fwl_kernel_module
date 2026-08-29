@@ -1,5 +1,7 @@
 obj-m += list_chardev.o  
 
+ccflags-y += -DDEBUG
+
 PWD  := $(CURDIR)
 
 all:
