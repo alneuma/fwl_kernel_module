@@ -314,6 +314,8 @@ alloc_chrdev_region_failed:
 
 static void __exit list_dev_exit(void)
 {
+	struct lcd_word_node *e;
+	struct lcd_word_node *n;
 	dev_t devt = MKDEV(major, 0);
 
 	printk("cleaning up %s ...\n", DRIVER_NAME);
@@ -321,6 +323,12 @@ static void __exit list_dev_exit(void)
 	class_destroy(cls);
 	cdev_del(&list_dev);
 	unregister_chrdev_region(devt, 1);
+
+	list_for_each_entry_safe(e, n, &word_list, list) {
+		list_del(&e->list);
+		kfree(e);
+	}
+
 	printk("%s removed successfully\n", DRIVER_NAME);
 }
 
