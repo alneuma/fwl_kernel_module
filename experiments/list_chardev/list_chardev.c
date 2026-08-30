@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/list.h>
+#include <linux/ctype.h>
 
 #include <asm/errno.h>
 
@@ -15,13 +16,9 @@
 #define DEVBUF_SIZE 1024
 
 struct lcd_word {
+	struct list_head node;
 	size_t len;
 	char word[];
-};
-
-struct lcd_word_node {
-	struct list_head list;
-	struct lcd_word word;
 };
 
 static int major;
@@ -30,106 +27,48 @@ static struct class *cls;
 LIST_HEAD(word_list);
 static char devbuf[DEVBUF_SIZE];
 
+static void lcd_log_word(const struct lcd_word *word, const size_t num)
+{
+	// very unlikely to happen, but still
+	const int log_len =
+		(int)(word->len < (size_t)INT_MAX ? word->len : INT_MAX);
+	printk("%s: node %lu: %.*s", DRIVER_NAME, num, log_len, word->word);
+}
+
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 			     loff_t *f_pos)
 {
 	pr_debug("called\n");
 
-	struct lcd_word_node *e;
+	struct lcd_word *e;
 	struct list_head *cur;
-	size_t num_nodes = 0;
+	size_t num = 0;
 	list_for_each(cur, &word_list) {
-		++num_nodes;
-		e = list_entry(cur, struct lcd_word_node, list);
-		// unsafe cast to (int)
-		printk("%s: node %lu: %.*s", DRIVER_NAME, num_nodes, (int)e->word.len, e->word.word);
+		++num;
+		e = list_entry(cur, struct lcd_word, node);
+		lcd_log_word(e, num);
 	}
 	return 0;
 }
 
-static int lcd_isspace(const char c)
+// success -> 0
+// failure -> error < 0
+static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
+			 const size_t prefix_len, const char *suffix,
+			 const size_t suffix_len)
 {
-	return c == ' ';
-}
-
-// lcd_append_word()
-//
-// must be within mutex protected region
-//
-// if prefix != NULL
-// appends word with prefix
-//
-// if prefix == NULL
-// appends word
-//
-// if word == NULL
-// only appends prefix
-//
-// if word == NULL && prefix == NULL
-// does nothing
-static int lcd_append_word(const struct lcd_word *prefix, const char *word,
-			   const size_t len)
-{
-	pr_debug("called\n");
-	size_t total_len;
-	size_t idx;
-
-	pr_debug("prefix = %p\n", prefix);
-
-	total_len = len;
-	if (prefix)
-		total_len += prefix->len;
-
-	pr_debug("total len = %lu\n", total_len);
-	if (!total_len)
+	const size_t len = prefix_len + suffix_len;
+	*new_word = NULL;
+	if (len == 0 || (!prefix && !suffix))
 		return 0;
-
-	struct lcd_word_node *new_node =
-		kmalloc(sizeof(*new_node) + total_len, GFP_KERNEL);
-	if (!new_node)
+	*new_word = kmalloc(sizeof(**new_word) + len, GFP_KERNEL);
+	if (!new_word)
 		return -ENOMEM;
-
-	new_node->word.len = total_len;
-
-	idx = 0;
-	if (prefix) {
-		memcpy(new_node->word.word, prefix->word, prefix->len);
-		idx += prefix->len;
-	}
-
-	if (word)
-		memcpy(new_node->word.word + idx, word, len);
-
-	list_add_tail(&new_node->list, &word_list);
-
-	pr_debug("appended word\n");
-
-	return 0;
-}
-
-static int lcd_save_residue(struct file *filp, const char *res,
-			    const size_t len)
-{
-	struct lcd_word *stash = NULL;
-
-	if (!filp->private_data) {
-		stash = kmalloc(sizeof(*stash) + len, GFP_KERNEL);
-		if (!stash)
-			return -ENOMEM;
-
-		memcpy(stash->word, res, len);
-		stash->len = len;
-		pr_debug("saved %ld bytes in file struct\n", len);
-	} else {
-		//edgecase: there still is residue
-	}
-
-	pr_debug("stash = %p\n", stash);
-	pr_debug("stash->len = %lu\n", stash->len);
-	pr_debug("stash->word = %.*s", (int)stash->len, stash->word);
-
-	filp->private_data = stash;
-
+	if (prefix)
+		memcpy((*new_word)->word, prefix, prefix_len);
+	if (suffix)
+		memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
+	(*new_word)->len = len;
 	return 0;
 }
 
@@ -139,62 +78,46 @@ static int lcd_save_residue(struct file *filp, const char *res,
 //
 static int save_words(struct file *filp, const char *buf, const size_t buf_size)
 {
-	enum parse_state {
-		WORD_RES,
-		WORD_NO_RES,
-		NO_WORD,
-	};
-
 	size_t idx = 0;
 	size_t wstart = 0;
 	int ret = 0;
-	enum parse_state state = WORD_RES;
-	int idx_space = lcd_isspace(buf[idx]);
+	struct lcd_word *new_word;
+	struct lcd_word *prefix = (struct lcd_word *)filp->private_data;
+	filp->private_data = NULL;
 
-	if (idx_space) {
-		ret = lcd_append_word(filp->private_data, NULL, 0);
-		kfree(filp->private_data);
-		filp->private_data = NULL;
+	while (idx < buf_size && !isspace(buf[idx])) {
+		++idx;
+	}
+	ret = lcd_word_make(&new_word, prefix ? prefix->word : NULL,
+			    prefix ? prefix->len : 0, buf, idx);
+	kfree(prefix);
+	if (ret)
+		return ret;
+	if (idx == buf_size) {
+		filp->private_data = new_word;
+		return ret;
+	}
+	if (new_word)
+		list_add_tail(&new_word->node, &word_list);
+
+	while (idx < buf_size) {
+		new_word = NULL;
+		while (idx < buf_size && isspace(buf[idx]))
+			++idx;
+		if (idx == buf_size)
+			return ret;
+		wstart = idx;
+		while (idx < buf_size && !isspace(buf[idx]))
+			++idx;
+		ret = lcd_word_make(&new_word, buf + wstart, idx - wstart, NULL,
+				    0);
 		if (ret)
 			return ret;
-		++idx;
-		state = NO_WORD;
+		if (idx == buf_size)
+			break;
+		list_add_tail(&new_word->node, &word_list);
 	}
-
-	while (idx != buf_size) {
-		if (state == WORD_RES && idx_space) {
-			ret = lcd_append_word(filp->private_data,
-					      buf + wstart,
-					      idx - wstart);
-			kfree(filp->private_data);
-			filp->private_data = NULL;
-			if (ret)
-				break;
-			state = NO_WORD;
-		}
-		else if (state == WORD_NO_RES && idx_space) {
-			ret = lcd_append_word(filp->private_data,
-					      buf + wstart,
-					      idx - wstart);
-			if (ret)
-				break;
-			state = NO_WORD;
-		}
-		else if (state == NO_WORD && !idx_space) {
-			wstart = idx;
-			state = WORD_NO_RES;
-		}
-
-		++idx;
-		idx_space = lcd_isspace(buf[idx]);
-	}
-
-	if (state != NO_WORD)
-		ret = lcd_save_residue(filp, buf + wstart, buf_size - wstart);
-	struct lcd_word *stash = filp->private_data;
-	pr_debug("stash = %p\n", stash);
-	pr_debug("stash->len = %lu\n", stash->len);
-	pr_debug("stash->word = %.*s", (int)stash->len, stash->word);
+	filp->private_data = new_word;
 
 	return ret;
 }
@@ -213,12 +136,14 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	// should be one writer or any number of readers
 	if (copy_from_user(devbuf, buf, copy_size))
 		return -EFAULT;
+
 	pr_debug("copied %lu bytes to buffer\n", copy_size);
 
 	ret = save_words(filp, devbuf, copy_size);
 	if (ret)
 		return ret;
 	// end of mutex(?) protection
+
 	pr_debug("filp->private_data = %p\n", filp->private_data);
 
 	return copy_size;
@@ -237,15 +162,13 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	pr_debug("filp->private_data = %p\n", filp->private_data);
-
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
-	if (lcd_append_word(filp->private_data, NULL, 0))
-		return -ENOMEM;
-	kfree(filp->private_data);
-	filp->private_data = NULL;
+	list_add_tail(&((struct lcd_word *)(filp->private_data))->node,
+		      &word_list);
 	// end of mutex(?) protection
+
+	filp->private_data = NULL;
 
 	return 0;
 }
@@ -265,10 +188,6 @@ static int __init list_dev_init(void)
 
 	printk("initializing %s ...\n", DRIVER_NAME);
 
-	// alloc_chrdev_region()
-	// returns major number + first minor number in dev
-	// second argument = base minor
-	// third argument = count
 	ret = alloc_chrdev_region(&devt, 0, 1, DRIVER_NAME);
 	if (ret) {
 		printk("failed to initialize %s: alloc_chrdev_region(): %d",
@@ -278,7 +197,7 @@ static int __init list_dev_init(void)
 
 	major = MAJOR(devt);
 	cdev_init(&list_dev, &list_dev_ops);
-	ret = cdev_add(&list_dev, devt, 1); // add one device
+	ret = cdev_add(&list_dev, devt, 1);
 	if (ret) {
 		printk("failed to initialize %s: cdev_add(): %d", DRIVER_NAME,
 		       ret);
@@ -316,8 +235,8 @@ alloc_chrdev_region_failed:
 
 static void __exit list_dev_exit(void)
 {
-	struct lcd_word_node *e;
-	struct lcd_word_node *n;
+	struct lcd_word *e;
+	struct lcd_word *n;
 	dev_t devt = MKDEV(major, 0);
 
 	printk("cleaning up %s ...\n", DRIVER_NAME);
@@ -326,8 +245,8 @@ static void __exit list_dev_exit(void)
 	cdev_del(&list_dev);
 	unregister_chrdev_region(devt, 1);
 
-	list_for_each_entry_safe(e, n, &word_list, list) {
-		list_del(&e->list);
+	list_for_each_entry_safe(e, n, &word_list, node) {
+		list_del(&e->node);
 		kfree(e);
 	}
 
