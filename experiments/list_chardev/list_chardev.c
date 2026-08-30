@@ -29,7 +29,7 @@ static struct class *cls;
 LIST_HEAD(word_list);
 static char devbuf[DEVBUF_SIZE];
 
-static void lcd_log_word(const struct lcd_word *word, const size_t num)
+static void lcd_log_word(const struct lcd_word *word, size_t num)
 {
 	// very unlikely to happen, but still
 	const int log_len =
@@ -63,8 +63,8 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 // success -> 0
 // failure -> error < 0
 static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
-			 const size_t prefix_len, const char *suffix,
-			 const size_t suffix_len)
+			 size_t prefix_len, const char *suffix,
+			 size_t suffix_len)
 {
 	const size_t len = prefix_len + suffix_len;
 	*new_word = NULL;
@@ -85,7 +85,7 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 //
 // must be within mutex protected region
 //
-static int save_words(struct file *filp, const char *buf, const size_t buf_size)
+static int save_words(struct file *filp, const char *buf, size_t buf_size)
 {
 	size_t idx = 0;
 	size_t wstart = 0;
