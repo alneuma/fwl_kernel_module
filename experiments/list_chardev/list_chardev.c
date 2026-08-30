@@ -12,7 +12,7 @@
 
 #include <asm/errno.h>
 
-#define DRIVER_NAME "list_dev"
+#define DRIVER_NAME "list_chardev"
 #define DEVBUF_SIZE 1024
 
 struct lcd_word {
