@@ -35,11 +35,8 @@ static void lcd_log_word(const struct lcd_word *word, const size_t num)
 	printk("%s: node %lu: %.*s", DRIVER_NAME, num, log_len, word->word);
 }
 
-static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
-			     loff_t *f_pos)
+static void lcd_log_list(void)
 {
-	pr_debug("called\n");
-
 	struct lcd_word *e;
 	struct list_head *cur;
 	size_t num = 0;
@@ -48,6 +45,14 @@ static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
 		e = list_entry(cur, struct lcd_word, node);
 		lcd_log_word(e, num);
 	}
+}
+
+static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
+			     loff_t *f_pos)
+{
+	pr_debug("called\n");
+
+	lcd_log_list();
 	return 0;
 }
 
@@ -161,6 +166,7 @@ static int list_dev_open(struct inode *inode, struct file *filp)
 static int list_dev_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
+	lcd_log_list();
 
 	// start of mutex(?) protection
 	// should be one writer or any number of readers
