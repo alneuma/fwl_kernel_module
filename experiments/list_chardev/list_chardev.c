@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/ctype.h>
+#include <linux/mutex.h>
 
 #include <asm/errno.h>
 
@@ -21,6 +22,7 @@ struct lcd_word {
 	char word[];
 };
 
+static DEFINE_MUTEX(lcd_mutex);
 static int major;
 static struct cdev list_dev;
 static struct class *cls;
@@ -40,11 +42,13 @@ static void lcd_log_list(void)
 	struct lcd_word *e;
 	struct list_head *cur;
 	size_t num = 0;
+	mutex_lock(&lcd_mutex);
 	list_for_each(cur, &word_list) {
 		++num;
 		e = list_entry(cur, struct lcd_word, node);
 		lcd_log_word(e, num);
 	}
+	mutex_unlock(&lcd_mutex);
 }
 
 static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
@@ -137,17 +141,16 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 
 	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
 
-	// start of mutex(?) protection
-	// should be one writer or any number of readers
+	mutex_lock(&lcd_mutex);
 	if (copy_from_user(devbuf, buf, copy_size))
 		return -EFAULT;
 
 	pr_debug("copied %lu bytes to buffer\n", copy_size);
 
 	ret = save_words(filp, devbuf, copy_size);
+	mutex_unlock(&lcd_mutex);
 	if (ret)
 		return ret;
-	// end of mutex(?) protection
 
 	pr_debug("filp->private_data = %p\n", filp->private_data);
 
@@ -167,12 +170,12 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	// start of mutex(?) protection
-	// should be one writer or any number of readers
-	if (filp->private_data)
+	if (filp->private_data) {
+		mutex_lock(&lcd_mutex);
 		list_add_tail(&((struct lcd_word *)(filp->private_data))->node,
 			      &word_list);
-	// end of mutex(?) protection
+		mutex_unlock(&lcd_mutex);
+	}
 
 	filp->private_data = NULL;
 
