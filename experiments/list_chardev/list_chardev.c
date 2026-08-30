@@ -24,7 +24,7 @@ struct lcd_word {
 
 static DEFINE_MUTEX(lcd_mutex);
 static int major;
-static struct cdev list_dev;
+static struct cdev list_chardev;
 static struct class *cls;
 LIST_HEAD(word_list);
 static char devbuf[DEVBUF_SIZE];
@@ -51,7 +51,7 @@ static void lcd_log_list(void)
 	mutex_unlock(&lcd_mutex);
 }
 
-static ssize_t list_dev_read(struct file *filp, char __user *buf, size_t count,
+static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			     loff_t *f_pos)
 {
 	pr_debug("called\n");
@@ -131,7 +131,7 @@ static int save_words(struct file *filp, const char *buf, size_t buf_size)
 	return ret;
 }
 
-static ssize_t list_dev_write(struct file *filp, const char __user *buf,
+static ssize_t lcd_write(struct file *filp, const char __user *buf,
 			      size_t count, loff_t *f_pos)
 {
 	size_t copy_size;
@@ -157,7 +157,7 @@ static ssize_t list_dev_write(struct file *filp, const char __user *buf,
 	return copy_size;
 }
 
-static int list_dev_open(struct inode *inode, struct file *filp)
+static int lcd_open(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
@@ -166,7 +166,7 @@ static int list_dev_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-static int list_dev_release(struct inode *inode, struct file *filp)
+static int lcd_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
@@ -182,15 +182,15 @@ static int list_dev_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-static struct file_operations list_dev_ops = {
+static struct file_operations lcd_ops = {
 	.owner = THIS_MODULE,
-	.open = list_dev_open,
-	.release = list_dev_release,
-	.read = list_dev_read,
-	.write = list_dev_write,
+	.open = lcd_open,
+	.release = lcd_release,
+	.read = lcd_read,
+	.write = lcd_write,
 };
 
-static int __init list_dev_init(void)
+static int __init lcd_init(void)
 {
 	dev_t devt;
 	int ret = 0;
@@ -205,8 +205,8 @@ static int __init list_dev_init(void)
 	}
 
 	major = MAJOR(devt);
-	cdev_init(&list_dev, &list_dev_ops);
-	ret = cdev_add(&list_dev, devt, 1);
+	cdev_init(&list_chardev, &lcd_ops);
+	ret = cdev_add(&list_chardev, devt, 1);
 	if (ret) {
 		printk("failed to initialize %s: cdev_add(): %d", DRIVER_NAME,
 		       ret);
@@ -235,14 +235,14 @@ static int __init list_dev_init(void)
 device_create_failed:
 	class_destroy(cls);
 class_create_failed:
-	cdev_del(&list_dev);
+	cdev_del(&list_chardev);
 cdev_add_failed:
 	unregister_chrdev_region(devt, 1);
 alloc_chrdev_region_failed:
 	return ret;
 }
 
-static void __exit list_dev_exit(void)
+static void __exit lcd_exit(void)
 {
 	struct lcd_word *e;
 	struct lcd_word *n;
@@ -251,7 +251,7 @@ static void __exit list_dev_exit(void)
 	printk("cleaning up %s ...\n", DRIVER_NAME);
 	device_destroy(cls, devt);
 	class_destroy(cls);
-	cdev_del(&list_dev);
+	cdev_del(&list_chardev);
 	unregister_chrdev_region(devt, 1);
 
 	list_for_each_entry_safe(e, n, &word_list, node) {
@@ -262,8 +262,8 @@ static void __exit list_dev_exit(void)
 	printk("%s removed successfully\n", DRIVER_NAME);
 }
 
-module_init(list_dev_init);
-module_exit(list_dev_exit);
+module_init(lcd_init);
+module_exit(lcd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("alneuma");
