@@ -13,8 +13,7 @@
 
 #include <asm/errno.h>
 
-#define DRIVER_NAME "list_chardev"
-#define DEVBUF_SIZE 1024
+#define DRIVER_NAME "word_lister"
 
 struct lcd_word {
 	struct list_head node;
@@ -160,20 +159,27 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 {
 	pr_debug("called\n");
 
-	size_t copy_size;
 	int ret;
-	char devbuf[DEVBUF_SIZE];
 
-	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
+	char *devbuf = kmalloc(count, GFP_KERNEL);
+	if (!devbuf) {
+		ret = -ENOMEM;
+		goto kmalloc_failed;
+	}
 
-	if (copy_from_user(devbuf, buf, copy_size))
-		return -EFAULT;
+	if (copy_from_user(devbuf, buf, count)) {
+		ret = -EFAULT;
+		goto copy_from_user_failed;
+	}
 
 	mutex_lock(&lcd_mutex);
-	ret = lcd_enlist_words_locked(filp, devbuf, copy_size);
+	ret = lcd_enlist_words_locked(filp, devbuf, count);
 	mutex_unlock(&lcd_mutex);
 
-	return ret ? ret : copy_size;
+copy_from_user_failed:
+	kfree(devbuf);
+kmalloc_failed:
+	return ret ? ret : count;
 }
 
 static int lcd_open(struct inode *inode, struct file *filp)
