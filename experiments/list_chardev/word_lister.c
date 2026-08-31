@@ -1,7 +1,5 @@
 // This toy kernel module implements a character device that enqueues all words
 // written to it in a list.
-// Reading from the device does not work one would expect.
-// Instead this simply causes the whole list to be written to the kernel logs.
 //
 // A word is considered to be any number of consecutive bytes
 // such that for each byte b holds: !isspace(b) or b == 0x0.
@@ -14,6 +12,7 @@
 //
 // Currently word size as well as list size are unbounded.
 // Buffer size is limited to 4096.
+// To prevent resource drain this will be changed in future iterations.
 //
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -32,6 +31,7 @@
 
 #define LCD_DRIVER_NAME "word_lister"
 #define LCD_MAX_WRITE 4096
+#define READ_WORD_SEP ' '
 
 struct lcd_word {
 	struct list_head node;
@@ -42,6 +42,7 @@ struct lcd_word {
 struct lcd_file {
 	struct mutex lock;
 	struct lcd_word *word;
+	struct list_head *cur_read;
 };
 
 static DEFINE_MUTEX(lcd_mutex);
@@ -66,41 +67,89 @@ static void lcd_word_list_clear(struct list_head *list)
 	}
 }
 
-static void lcd_log_word(const struct lcd_word *word, size_t num)
+static size_t lcd_copy_word(const struct lcd_word *word, size_t pos, char *buf,
+			    size_t buf_size)
 {
-	// Theoretical possiblity; actual kmalloc() size is limited
-	const int log_len = (int)min(word->len, (size_t)INT_MAX);
-	pr_info("node %zu: %.*s\n", num, log_len, word->word);
+	size_t copy_size = min(word->len - pos, buf_size);
+	memcpy(buf, word->word + pos, copy_size);
+	return copy_size;
 }
 
-static void lcd_log_list(void)
+static int nothing_to_read(struct lcd_file *file_data, loff_t pos)
 {
-	pr_debug("called\n");
-
 	struct lcd_word *e;
-	size_t num = 0;
 
 	mutex_lock(&lcd_mutex);
-
-	list_for_each_entry(e, &word_list, node) {
-		lcd_log_word(e, ++num);
+	if (file_data->cur_read &&
+	    list_is_last(file_data->cur_read, &word_list)) {
+		e = container_of_const(file_data->cur_read, struct lcd_word,
+				       node);
+		if (pos == e->len) {
+			mutex_unlock(&lcd_mutex);
+			return 1;
+		}
 	}
-
 	mutex_unlock(&lcd_mutex);
+	return 0;
 }
 
-// lcd_read()
-//
-// Currently this logs the list to the kernel logs.
-//
-// TODO: implement real read behavior
+
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
 {
-	pr_debug("called\n");
+	pr_debug("called");
 
-	lcd_log_list();
-	return 0;
+	struct lcd_file *file_data = filp->private_data;
+	struct list_head *start = &word_list;
+	struct lcd_word *e;
+	struct list_head *anchor;
+	loff_t pos;
+	size_t copied_total = 0;
+	size_t copied = 0;
+
+	if (nothing_to_read(file_data, *f_pos))
+		return 0;
+
+	char *tmp_buf = kmalloc(count, GFP_KERNEL);
+	if (!tmp_buf)
+		return -ENOMEM;
+
+	mutex_lock(&lcd_mutex);
+	pos = *f_pos;
+	anchor = file_data->cur_read;
+
+	if (anchor)
+		start = anchor;
+
+	list_for_each_entry(e, start, node) {
+		anchor = &e->node;
+		if (copied_total == count)
+			break;
+		copied = lcd_copy_word(e, pos, tmp_buf + copied_total,
+				       count - copied_total);
+		copied_total += copied;
+		pos += copied;
+		if (copied_total == count)
+			break;
+		if (list_is_last(&e->node, &word_list))
+			break;
+		tmp_buf[copied_total++] = READ_WORD_SEP;
+		pos = 0;
+	}
+	mutex_unlock(&lcd_mutex);
+
+	if (copy_to_user(buf, tmp_buf, copied_total)) {
+		kfree(tmp_buf);
+		return -EFAULT;
+	}
+	kfree(tmp_buf);
+
+	mutex_lock(&file_data->lock);
+	*f_pos = pos;
+	file_data->cur_read = anchor;
+	mutex_unlock(&file_data->lock);
+
+	return copied_total;
 }
 
 // lcd_word_make()
@@ -120,7 +169,7 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
 			 size_t suffix_len)
 {
-	pr_debug("called\n");
+	pr_debug("called");
 
 	size_t len;
 	if (check_add_overflow(prefix_len, suffix_len, &len))
@@ -156,7 +205,7 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 static int lcd_enlist_words(struct list_head *list, struct file *filp,
 			    const char *buf, size_t buf_size)
 {
-	pr_debug("called\n");
+	pr_debug("called");
 
 	int ret = 0;
 	size_t idx = 0;
@@ -213,7 +262,7 @@ failure:
 static ssize_t lcd_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
-	pr_debug("called\n");
+	pr_debug("called");
 
 	LIST_HEAD(tmp_list);
 	int ret;
@@ -238,13 +287,13 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 	mutex_unlock(&lcd_mutex);
 
 	return count;
-
 }
 
 static int lcd_open(struct inode *inode, struct file *filp)
 {
-	pr_debug("called\n");
+	pr_debug("called");
 
+	// sets file->data->word = NULL
 	struct lcd_file *file_data = kzalloc(sizeof(*file_data), GFP_KERNEL);
 	if (!file_data)
 		return -ENOMEM;
@@ -258,7 +307,7 @@ static int lcd_open(struct inode *inode, struct file *filp)
 // adds unfinished per open words to list
 static int lcd_release(struct inode *inode, struct file *filp)
 {
-	pr_debug("called\n");
+	pr_debug("called");
 
 	struct lcd_file *file_data = filp->private_data;
 	struct lcd_word *word = file_data->word;
@@ -287,7 +336,7 @@ static int __init lcd_init(void)
 {
 	int ret = 0;
 
-	pr_info("initializing %s ...\n", LCD_DRIVER_NAME);
+	pr_info("initializing %s ...", LCD_DRIVER_NAME);
 
 	ret = alloc_chrdev_region(&devt, 0, 1, LCD_DRIVER_NAME);
 	if (ret) {
@@ -321,7 +370,7 @@ static int __init lcd_init(void)
 		goto device_create_failed;
 	}
 
-	pr_info("%s initialized successfully\n", LCD_DRIVER_NAME);
+	pr_info("%s initialized successfully", LCD_DRIVER_NAME);
 	return 0;
 
 device_create_failed:
@@ -336,7 +385,7 @@ alloc_chrdev_region_failed:
 
 static void __exit lcd_exit(void)
 {
-	pr_info("cleaning up %s ...\n", LCD_DRIVER_NAME);
+	pr_info("cleaning up %s ...", LCD_DRIVER_NAME);
 
 	device_destroy(cls, devt);
 	class_destroy(cls);
@@ -344,7 +393,7 @@ static void __exit lcd_exit(void)
 	unregister_chrdev_region(devt, 1);
 	lcd_word_list_clear(&word_list);
 
-	pr_info("%s removed successfully\n", LCD_DRIVER_NAME);
+	pr_info("%s removed successfully", LCD_DRIVER_NAME);
 }
 
 module_init(lcd_init);
