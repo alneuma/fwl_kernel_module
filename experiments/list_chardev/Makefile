@@ -1,4 +1,4 @@
-obj-m += list_chardev.o  
+obj-m += word_lister.o  
 
 ccflags-y += -DDEBUG
 

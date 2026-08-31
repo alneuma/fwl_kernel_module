@@ -26,28 +26,31 @@ static DEFINE_MUTEX(lcd_mutex);
 static int major;
 static struct cdev list_chardev;
 static struct class *cls;
-LIST_HEAD(word_list);
-static char devbuf[DEVBUF_SIZE];
+static LIST_HEAD(word_list);
 
 static void lcd_log_word(const struct lcd_word *word, size_t num)
 {
-	// very unlikely to happen, but still
+	pr_debug("called\n");
+
+	// is this even possible?
 	const int log_len =
 		(int)(word->len < (size_t)INT_MAX ? word->len : INT_MAX);
-	printk("%s: node %lu: %.*s", DRIVER_NAME, num, log_len, word->word);
+	pr_info("node %zu: %.*s\n", num, log_len, word->word);
 }
 
 static void lcd_log_list(void)
 {
+	pr_debug("called\n");
+
 	struct lcd_word *e;
-	struct list_head *cur;
 	size_t num = 0;
+
 	mutex_lock(&lcd_mutex);
-	list_for_each(cur, &word_list) {
-		++num;
-		e = list_entry(cur, struct lcd_word, node);
-		lcd_log_word(e, num);
+
+	list_for_each_entry(e, &word_list, node) {
+		lcd_log_word(e, ++num);
 	}
+
 	mutex_unlock(&lcd_mutex);
 }
 
@@ -66,12 +69,21 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
 			 size_t suffix_len)
 {
+	pr_debug("called\n");
+
+	if (prefix_len > SIZE_MAX - suffix_len)
+		return -EOVERFLOW;
+
 	const size_t len = prefix_len + suffix_len;
+
+	if (len > SIZE_MAX - sizeof(**new_word))
+		return -EOVERFLOW;
+
 	*new_word = NULL;
 	if (len == 0 || (!prefix && !suffix))
 		return 0;
 	*new_word = kmalloc(sizeof(**new_word) + len, GFP_KERNEL);
-	if (!new_word)
+	if (!*new_word)
 		return -ENOMEM;
 	if (prefix)
 		memcpy((*new_word)->word, prefix, prefix_len);
@@ -81,27 +93,39 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 	return 0;
 }
 
-// save_words()
+// lcd_enlist_words_locked()
 //
 // must be within mutex protected region
 //
-static int save_words(struct file *filp, const char *buf, size_t buf_size)
+// TODO: implement transaction semantics
+//
+// Consider following algorithm:
+// 1. Existing partial word?
+// 2. Find next whitespace.
+// 3. If no whitespace, extend partial.
+// 4. Otherwise commit the word.
+// 5. Continue.
+// 6. Save trailing partial word.
+static int lcd_enlist_words_locked(struct file *filp, const char *buf, size_t buf_size)
 {
+	pr_debug("called\n");
+
 	size_t idx = 0;
 	size_t wstart = 0;
 	int ret = 0;
 	struct lcd_word *new_word;
-	struct lcd_word *prefix = (struct lcd_word *)filp->private_data;
+	struct lcd_word *prefix = filp->private_data;
 	filp->private_data = NULL;
 
-	while (idx < buf_size && !isspace(buf[idx])) {
+	while (idx < buf_size && !isspace((unsigned char)buf[idx])) {
 		++idx;
 	}
 	ret = lcd_word_make(&new_word, prefix ? prefix->word : NULL,
 			    prefix ? prefix->len : 0, buf, idx);
-	kfree(prefix);
 	if (ret)
 		return ret;
+	kfree(prefix);
+
 	if (idx == buf_size) {
 		filp->private_data = new_word;
 		return ret;
@@ -111,12 +135,12 @@ static int save_words(struct file *filp, const char *buf, size_t buf_size)
 
 	while (idx < buf_size) {
 		new_word = NULL;
-		while (idx < buf_size && isspace(buf[idx]))
+		while (idx < buf_size && isspace((unsigned char)buf[idx]))
 			++idx;
 		if (idx == buf_size)
 			return ret;
 		wstart = idx;
-		while (idx < buf_size && !isspace(buf[idx]))
+		while (idx < buf_size && !isspace((unsigned char)buf[idx]))
 			++idx;
 		ret = lcd_word_make(&new_word, buf + wstart, idx - wstart, NULL,
 				    0);
@@ -134,27 +158,22 @@ static int save_words(struct file *filp, const char *buf, size_t buf_size)
 static ssize_t lcd_write(struct file *filp, const char __user *buf,
 			      size_t count, loff_t *f_pos)
 {
+	pr_debug("called\n");
+
 	size_t copy_size;
 	int ret;
-
-	pr_debug("called\n");
+	char devbuf[DEVBUF_SIZE];
 
 	copy_size = DEVBUF_SIZE < count ? DEVBUF_SIZE : count;
 
-	mutex_lock(&lcd_mutex);
 	if (copy_from_user(devbuf, buf, copy_size))
 		return -EFAULT;
 
-	pr_debug("copied %lu bytes to buffer\n", copy_size);
-
-	ret = save_words(filp, devbuf, copy_size);
+	mutex_lock(&lcd_mutex);
+	ret = lcd_enlist_words_locked(filp, devbuf, copy_size);
 	mutex_unlock(&lcd_mutex);
-	if (ret)
-		return ret;
 
-	pr_debug("filp->private_data = %p\n", filp->private_data);
-
-	return copy_size;
+	return ret ? ret : copy_size;
 }
 
 static int lcd_open(struct inode *inode, struct file *filp)
@@ -170,14 +189,14 @@ static int lcd_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	if (filp->private_data) {
-		mutex_lock(&lcd_mutex);
-		list_add_tail(&((struct lcd_word *)(filp->private_data))->node,
-			      &word_list);
-		mutex_unlock(&lcd_mutex);
-	}
+	struct lcd_word *word = filp->private_data;
 
-	filp->private_data = NULL;
+	if (word) {
+		mutex_lock(&lcd_mutex);
+		list_add_tail(&word->node, &word_list);
+		mutex_unlock(&lcd_mutex);
+		filp->private_data = NULL;
+	}
 
 	return 0;
 }
@@ -254,10 +273,12 @@ static void __exit lcd_exit(void)
 	cdev_del(&list_chardev);
 	unregister_chrdev_region(devt, 1);
 
+	mutex_lock(&lcd_mutex);
 	list_for_each_entry_safe(e, n, &word_list, node) {
 		list_del(&e->node);
 		kfree(e);
 	}
+	mutex_unlock(&lcd_mutex);
 
 	printk("%s removed successfully\n", DRIVER_NAME);
 }
