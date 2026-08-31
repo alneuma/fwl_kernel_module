@@ -21,6 +21,11 @@ struct lcd_word {
 	char word[];
 };
 
+struct lcd_file {
+	struct mutex lock;
+	struct lcd_word *word;
+};
+
 static DEFINE_MUTEX(lcd_mutex);
 static dev_t devt;
 static struct cdev list_chardev;
@@ -54,7 +59,7 @@ static void lcd_log_list(void)
 }
 
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
-			     loff_t *f_pos)
+			loff_t *f_pos)
 {
 	pr_debug("called\n");
 
@@ -82,7 +87,7 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 	if (len == 0)
 		return 0;
 
-	*new_word = kmalloc(sizeof(**new_word) + len, GFP_KERNEL);
+	*new_word = kmalloc(struct_size(*new_word, word, len), GFP_KERNEL);
 	if (!*new_word)
 		return -ENOMEM;
 
@@ -96,32 +101,34 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 	return 0;
 }
 
-static int lcd_enlist_words(struct list_head *list, struct file *filp, const char *buf, size_t buf_size) {
+static int lcd_enlist_words(struct list_head *list, struct file *filp,
+			    const char *buf, size_t buf_size)
+{
 	pr_debug("called\n");
 
-	LIST_HEAD(tmp_list);
 	int ret = 0;
-	int idx = 0;
-	int wstart = 0;
+	size_t idx = 0;
+	size_t wstart = 0;
+	struct lcd_file *file_data = filp->private_data;
 	struct lcd_word *new_word = NULL;
-	struct lcd_word *prefix;
 	struct lcd_word *e;
 	struct lcd_word *n;
 
-	if (filp->private_data) {
-		prefix = filp->private_data;
+	mutex_lock(&file_data->lock);
 
+	if (file_data->word) {
 		while (idx < buf_size && !isspace((unsigned char)buf[idx]))
 			++idx;
 
-		ret = lcd_word_make(&new_word, prefix->word, prefix->len, buf, idx);
+		ret = lcd_word_make(&new_word, file_data->word->word,
+				    file_data->word->len, buf, idx);
 		if (ret)
 			goto failure;
 
 		if (idx == buf_size)
 			goto success;
 
-		list_add_tail(&new_word->node, &tmp_list);
+		list_add_tail(&new_word->node, list);
 	}
 
 	while (idx < buf_size) {
@@ -139,25 +146,25 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp, const cha
 			goto failure;
 		if (idx == buf_size)
 			goto success;
-		list_add_tail(&new_word->node, &tmp_list);
+		list_add_tail(&new_word->node, list);
 	}
-	goto success;
 
 failure:
-	list_for_each_entry_safe(e, n, &tmp_list, node) {
+	list_for_each_entry_safe(e, n, list, node) {
 		list_del(&e->node);
 		kfree(e);
 	}
-	return ret;
+	new_word = file_data->word;
+	file_data->word = NULL;
 success:
-	kfree(filp->private_data);
-	filp->private_data = new_word;
-	list_splice_tail(&tmp_list, list);
+	kfree(file_data->word);
+	file_data->word = new_word;
+	mutex_unlock(&file_data->lock);
 	return ret;
 }
 
 static ssize_t lcd_write(struct file *filp, const char __user *buf,
-			      size_t count, loff_t *f_pos)
+			 size_t count, loff_t *f_pos)
 {
 	pr_debug("called\n");
 
@@ -193,7 +200,15 @@ static int lcd_open(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	filp->private_data = NULL;
+	struct lcd_file *file_data;
+
+	filp->private_data = kmalloc(sizeof(struct lcd_file), GFP_KERNEL);
+	if (!filp->private_data)
+		return -ENOMEM;
+
+	file_data = filp->private_data;
+	file_data->word = NULL;
+	mutex_init(&file_data->lock);
 
 	return 0;
 }
@@ -202,14 +217,15 @@ static int lcd_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	struct lcd_word *word = filp->private_data;
+	struct lcd_file *file_data = filp->private_data;
 
-	if (word) {
+	if (file_data->word) {
 		mutex_lock(&lcd_mutex);
-		list_add_tail(&word->node, &word_list);
+		list_add_tail(&file_data->word->node, &word_list);
 		mutex_unlock(&lcd_mutex);
-		filp->private_data = NULL;
 	}
+
+	kfree(filp->private_data);
 
 	return 0;
 }
@@ -230,7 +246,7 @@ static int __init lcd_init(void)
 
 	ret = alloc_chrdev_region(&devt, 0, 1, DRIVER_NAME);
 	if (ret) {
-		printk("failed to initialize %s: alloc_chrdev_region(): %d",
+		pr_err("failed to initialize %s: alloc_chrdev_region(): %d",
 		       DRIVER_NAME, ret);
 		goto alloc_chrdev_region_failed;
 	}
@@ -238,7 +254,7 @@ static int __init lcd_init(void)
 	cdev_init(&list_chardev, &lcd_ops);
 	ret = cdev_add(&list_chardev, devt, 1);
 	if (ret) {
-		printk("failed to initialize %s: cdev_add(): %d", DRIVER_NAME,
+		pr_err("failed to initialize %s: cdev_add(): %d", DRIVER_NAME,
 		       ret);
 		goto cdev_add_failed;
 	}
@@ -246,7 +262,7 @@ static int __init lcd_init(void)
 	cls = class_create(DRIVER_NAME); // assumes kernel >= 6.4.0
 	if (IS_ERR(cls)) {
 		ret = PTR_ERR(cls);
-		printk("failed to initialize %s: class_create(): %d",
+		pr_err("failed to initialize %s: class_create(): %d",
 		       DRIVER_NAME, ret);
 		goto class_create_failed;
 	}
@@ -254,7 +270,7 @@ static int __init lcd_init(void)
 	struct device *retp = device_create(cls, NULL, devt, NULL, DRIVER_NAME);
 	if (IS_ERR(retp)) {
 		ret = PTR_ERR(retp);
-		printk("failed to initialize %s: device_create(): %d",
+		pr_err("failed to initialize %s: device_create(): %d",
 		       DRIVER_NAME, ret);
 		goto device_create_failed;
 	}
