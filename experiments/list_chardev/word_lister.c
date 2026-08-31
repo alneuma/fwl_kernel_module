@@ -1,3 +1,10 @@
+// A word is considered to be any number of consecutive bytes
+// such that for each byte b hold !isspace(b).
+//
+// Word boundaries are preserved between different calls to write()
+// and per call to open().
+//
+// release() adds unfinished words to the list.
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
 #include <linux/module.h>
@@ -10,10 +17,10 @@
 #include <linux/list.h>
 #include <linux/ctype.h>
 #include <linux/mutex.h>
+#include <linux/errno.h>
 
-#include <asm/errno.h>
-
-#define DRIVER_NAME "word_lister"
+#define LCD_DRIVER_NAME "word_lister"
+#define LCD_MAX_WRITE 4096
 
 struct lcd_word {
 	struct list_head node;
@@ -36,9 +43,8 @@ static void lcd_log_word(const struct lcd_word *word, size_t num)
 {
 	pr_debug("called\n");
 
-	// is this even possible?
-	const int log_len =
-		(int)(word->len < (size_t)INT_MAX ? word->len : INT_MAX);
+	// Theoretical possiblity but actual kmalloc() size is hardware limited
+	const int log_len = (int)min(word->len, (size_t)INT_MAX);
 	printk("node %zu: %.*s\n", num, log_len, word->word);
 }
 
@@ -67,8 +73,18 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	return 0;
 }
 
+// lcd_word_make()
+// composes a new word from prefix and suffix
+//
+// prefix_len + suffix_len == 0 -> word of length 0 will be created
+//
+// return values:
 // success -> 0
 // failure -> error < 0
+//
+// unchecked runtime errors:
+// prefix == NULL && prefix_len > 0
+// suffix == NULL && suffix_len > 0
 static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
 			 size_t suffix_len)
@@ -80,27 +96,31 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 
 	const size_t len = prefix_len + suffix_len;
 
-	if (len > SIZE_MAX - sizeof(**new_word))
+	const size_t size = struct_size(*new_word, word, len);
+	if (size == SIZE_MAX)
 		return -EOVERFLOW;
 
-	*new_word = NULL;
-	if (len == 0)
-		return 0;
-
-	*new_word = kmalloc(struct_size(*new_word, word, len), GFP_KERNEL);
+	*new_word = kmalloc(size, GFP_KERNEL);
 	if (!*new_word)
 		return -ENOMEM;
 
-	if (prefix)
-		memcpy((*new_word)->word, prefix, prefix_len);
-	if (suffix)
-		memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
+	memcpy((*new_word)->word, prefix, prefix_len);
+	memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
 
 	(*new_word)->len = len;
 
 	return 0;
 }
 
+// lcd_enlist_words()
+//
+// If successful words in buf will be appended to list. The struct lcd_word
+// saved in filp->private_data will be considered to be the start of the buffer.
+// if there is an unfinished word at the end of the buffer it will be saved
+// in the struct lcd_word in filp->private_data.
+//
+// Is transactionally safe, i.e. in case of failure list and filp will not be
+// modified.
 static int lcd_enlist_words(struct list_head *list, struct file *filp,
 			    const char *buf, size_t buf_size)
 {
@@ -171,66 +191,60 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 	LIST_HEAD(tmp_list);
 	int ret;
 
-	char *devbuf = kmalloc(count, GFP_KERNEL);
-	if (!devbuf) {
-		ret = -ENOMEM;
-		goto kmalloc_failed;
-	}
+	if (!count)
+		return 0;
 
-	if (copy_from_user(devbuf, buf, count)) {
-		ret = -EFAULT;
-		goto copy_from_user_failed;
-	}
+	if (count > LCD_MAX_WRITE)
+		return -E2BIG;
+
+	char *devbuf = memdup_user(buf, count);
+	if (IS_ERR(devbuf))
+		return PTR_ERR(devbuf);
 
 	ret = lcd_enlist_words(&tmp_list, filp, devbuf, count);
+	if (ret)
+		return ret;
 
-	if (!ret) {
-		mutex_lock(&lcd_mutex);
-		list_splice_tail(&tmp_list, &word_list);
-		mutex_unlock(&lcd_mutex);
-	}
+	mutex_lock(&lcd_mutex);
+	list_splice_tail_init(&tmp_list, &word_list);
+	mutex_unlock(&lcd_mutex);
 
-copy_from_user_failed:
-	kfree(devbuf);
-kmalloc_failed:
-	return ret ? ret : count;
+	return count;
 }
 
 static int lcd_open(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	struct lcd_file *file_data;
-
-	filp->private_data = kmalloc(sizeof(struct lcd_file), GFP_KERNEL);
-	if (!filp->private_data)
+	struct lcd_file *file_data = kzalloc(sizeof(*file_data), GFP_KERNEL);
+	if (!file_data)
 		return -ENOMEM;
 
-	file_data = filp->private_data;
-	file_data->word = NULL;
 	mutex_init(&file_data->lock);
+	filp->private_data = file_data;
 
 	return 0;
 }
 
+// adds unfinished per open words to list
 static int lcd_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
 	struct lcd_file *file_data = filp->private_data;
+	struct lcd_word *word = file_data->word;
+	kfree(filp->private_data);
 
-	if (file_data->word) {
+	if (word) {
 		mutex_lock(&lcd_mutex);
-		list_add_tail(&file_data->word->node, &word_list);
+		list_add_tail(&word->node, &word_list);
 		mutex_unlock(&lcd_mutex);
 	}
-
-	kfree(filp->private_data);
 
 	return 0;
 }
 
-static struct file_operations lcd_ops = {
+static const struct file_operations lcd_ops = {
 	.owner = THIS_MODULE,
 	.open = lcd_open,
 	.release = lcd_release,
@@ -242,40 +256,41 @@ static int __init lcd_init(void)
 {
 	int ret = 0;
 
-	printk("initializing %s ...\n", DRIVER_NAME);
+	pr_info("initializing %s ...\n", LCD_DRIVER_NAME);
 
-	ret = alloc_chrdev_region(&devt, 0, 1, DRIVER_NAME);
+	ret = alloc_chrdev_region(&devt, 0, 1, LCD_DRIVER_NAME);
 	if (ret) {
 		pr_err("failed to initialize %s: alloc_chrdev_region(): %d",
-		       DRIVER_NAME, ret);
+		       LCD_DRIVER_NAME, ret);
 		goto alloc_chrdev_region_failed;
 	}
 
 	cdev_init(&list_chardev, &lcd_ops);
 	ret = cdev_add(&list_chardev, devt, 1);
 	if (ret) {
-		pr_err("failed to initialize %s: cdev_add(): %d", DRIVER_NAME,
-		       ret);
+		pr_err("failed to initialize %s: cdev_add(): %d",
+		       LCD_DRIVER_NAME, ret);
 		goto cdev_add_failed;
 	}
 
-	cls = class_create(DRIVER_NAME); // assumes kernel >= 6.4.0
+	cls = class_create(LCD_DRIVER_NAME); // assumes kernel >= 6.4.0
 	if (IS_ERR(cls)) {
 		ret = PTR_ERR(cls);
 		pr_err("failed to initialize %s: class_create(): %d",
-		       DRIVER_NAME, ret);
+		       LCD_DRIVER_NAME, ret);
 		goto class_create_failed;
 	}
 
-	struct device *retp = device_create(cls, NULL, devt, NULL, DRIVER_NAME);
+	struct device *retp =
+		device_create(cls, NULL, devt, NULL, LCD_DRIVER_NAME);
 	if (IS_ERR(retp)) {
 		ret = PTR_ERR(retp);
 		pr_err("failed to initialize %s: device_create(): %d",
-		       DRIVER_NAME, ret);
+		       LCD_DRIVER_NAME, ret);
 		goto device_create_failed;
 	}
 
-	printk("%s initialized successfully\n", DRIVER_NAME);
+	pr_info("%s initialized successfully\n", LCD_DRIVER_NAME);
 	return 0;
 
 device_create_failed:
@@ -293,7 +308,8 @@ static void __exit lcd_exit(void)
 	struct lcd_word *e;
 	struct lcd_word *n;
 
-	printk("cleaning up %s ...\n", DRIVER_NAME);
+	pr_info("cleaning up %s ...\n", LCD_DRIVER_NAME);
+
 	device_destroy(cls, devt);
 	class_destroy(cls);
 	cdev_del(&list_chardev);
@@ -306,7 +322,7 @@ static void __exit lcd_exit(void)
 	}
 	mutex_unlock(&lcd_mutex);
 
-	printk("%s removed successfully\n", DRIVER_NAME);
+	pr_info("%s removed successfully\n", LCD_DRIVER_NAME);
 }
 
 module_init(lcd_init);
