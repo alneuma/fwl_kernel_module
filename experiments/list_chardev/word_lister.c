@@ -6,9 +6,8 @@
 // A word is considered to be any number of consecutive bytes
 // such that for each byte b hold !isspace(b).
 //
-// Word boundaries are preserved between different calls to write()
-// and per open file description.
-//
+// Word boundaries are preserved between different calls to write().
+// Different open file descriptions have independent word boundaries.
 // Only per open file description completed words are added to the list.
 //
 // On release() the last uncompleted word is considered to be completed.
@@ -49,6 +48,16 @@ static dev_t devt;
 static struct cdev list_chardev;
 static struct class *cls;
 static LIST_HEAD(word_list);
+
+static void lcd_word_list_clear(struct list_head *list) {
+	struct lcd_word *e;
+	struct lcd_word *n;
+
+	list_for_each_entry_safe(e, n, list, node) {
+		list_del(&e->node);
+		kfree(e);
+	}
+}
 
 static void lcd_log_word(const struct lcd_word *word, size_t num)
 {
@@ -147,8 +156,6 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	size_t wstart = 0;
 	struct lcd_file *file_data = filp->private_data;
 	struct lcd_word *new_word = NULL;
-	struct lcd_word *e;
-	struct lcd_word *n;
 
 	mutex_lock(&file_data->lock);
 
@@ -192,10 +199,7 @@ success:
 	return 0;
 failure:
 	mutex_unlock(&file_data->lock);
-	list_for_each_entry_safe(e, n, list, node) {
-		list_del(&e->node);
-		kfree(e);
-	}
+	lcd_word_list_clear(list);
 	return ret;
 }
 
@@ -324,9 +328,6 @@ alloc_chrdev_region_failed:
 
 static void __exit lcd_exit(void)
 {
-	struct lcd_word *e;
-	struct lcd_word *n;
-
 	pr_info("cleaning up %s ...\n", LCD_DRIVER_NAME);
 
 	device_destroy(cls, devt);
@@ -335,10 +336,7 @@ static void __exit lcd_exit(void)
 	unregister_chrdev_region(devt, 1);
 
 	mutex_lock(&lcd_mutex);
-	list_for_each_entry_safe(e, n, &word_list, node) {
-		list_del(&e->node);
-		kfree(e);
-	}
+	lcd_word_list_clear(&word_list);
 	mutex_unlock(&lcd_mutex);
 
 	pr_info("%s removed successfully\n", LCD_DRIVER_NAME);
