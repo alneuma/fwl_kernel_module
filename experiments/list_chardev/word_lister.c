@@ -79,16 +79,20 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 		return -EOVERFLOW;
 
 	*new_word = NULL;
-	if (len == 0 || (!prefix && !suffix))
+	if (len == 0)
 		return 0;
+
 	*new_word = kmalloc(sizeof(**new_word) + len, GFP_KERNEL);
 	if (!*new_word)
 		return -ENOMEM;
+
 	if (prefix)
 		memcpy((*new_word)->word, prefix, prefix_len);
 	if (suffix)
 		memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
+
 	(*new_word)->len = len;
+
 	return 0;
 }
 
