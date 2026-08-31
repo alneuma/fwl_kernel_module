@@ -92,20 +92,8 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 	return 0;
 }
 
-// lcd_enlist_words_locked()
-//
-// must be within mutex protected region
-//
 // TODO: implement transaction semantics
-//
-// Consider following algorithm:
-// 1. Existing partial word?
-// 2. Find next whitespace.
-// 3. If no whitespace, extend partial.
-// 4. Otherwise commit the word.
-// 5. Continue.
-// 6. Save trailing partial word.
-static int lcd_enlist_words_locked(struct file *filp, const char *buf, size_t buf_size)
+static int lcd_enlist_words(struct list_head *lst, struct file *filp, const char *buf, size_t buf_size)
 {
 	pr_debug("called\n");
 
@@ -130,7 +118,7 @@ static int lcd_enlist_words_locked(struct file *filp, const char *buf, size_t bu
 		return ret;
 	}
 	if (new_word)
-		list_add_tail(&new_word->node, &word_list);
+		list_add_tail(&new_word->node, lst);
 
 	while (idx < buf_size) {
 		new_word = NULL;
@@ -147,7 +135,7 @@ static int lcd_enlist_words_locked(struct file *filp, const char *buf, size_t bu
 			return ret;
 		if (idx == buf_size)
 			break;
-		list_add_tail(&new_word->node, &word_list);
+		list_add_tail(&new_word->node, lst);
 	}
 	filp->private_data = new_word;
 
@@ -159,6 +147,7 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 {
 	pr_debug("called\n");
 
+	LIST_HEAD(tmp_list);
 	int ret;
 
 	char *devbuf = kmalloc(count, GFP_KERNEL);
@@ -172,9 +161,13 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 		goto copy_from_user_failed;
 	}
 
-	mutex_lock(&lcd_mutex);
-	ret = lcd_enlist_words_locked(filp, devbuf, count);
-	mutex_unlock(&lcd_mutex);
+	ret = lcd_enlist_words(&tmp_list, filp, devbuf, count);
+
+	if (!ret) {
+		mutex_lock(&lcd_mutex);
+		list_splice_tail(&tmp_list, &word_list);
+		mutex_unlock(&lcd_mutex);
+	}
 
 copy_from_user_failed:
 	kfree(devbuf);
