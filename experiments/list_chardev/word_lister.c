@@ -22,7 +22,7 @@ struct lcd_word {
 };
 
 static DEFINE_MUTEX(lcd_mutex);
-static int major;
+static dev_t devt;
 static struct cdev list_chardev;
 static struct class *cls;
 static LIST_HEAD(word_list);
@@ -34,7 +34,7 @@ static void lcd_log_word(const struct lcd_word *word, size_t num)
 	// is this even possible?
 	const int log_len =
 		(int)(word->len < (size_t)INT_MAX ? word->len : INT_MAX);
-	pr_info("node %zu: %.*s\n", num, log_len, word->word);
+	printk("node %zu: %.*s\n", num, log_len, word->word);
 }
 
 static void lcd_log_list(void)
@@ -93,6 +93,8 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 }
 
 // TODO: implement transaction semantics
+// TODO: because list is local and does not get attached to shared one on
+// failure, there are leaks on failure atm
 static int lcd_enlist_words(struct list_head *lst, struct file *filp, const char *buf, size_t buf_size)
 {
 	pr_debug("called\n");
@@ -210,7 +212,6 @@ static struct file_operations lcd_ops = {
 
 static int __init lcd_init(void)
 {
-	dev_t devt;
 	int ret = 0;
 
 	printk("initializing %s ...\n", DRIVER_NAME);
@@ -222,7 +223,6 @@ static int __init lcd_init(void)
 		goto alloc_chrdev_region_failed;
 	}
 
-	major = MAJOR(devt);
 	cdev_init(&list_chardev, &lcd_ops);
 	ret = cdev_add(&list_chardev, devt, 1);
 	if (ret) {
@@ -264,7 +264,6 @@ static void __exit lcd_exit(void)
 {
 	struct lcd_word *e;
 	struct lcd_word *n;
-	dev_t devt = MKDEV(major, 0);
 
 	printk("cleaning up %s ...\n", DRIVER_NAME);
 	device_destroy(cls, devt);
