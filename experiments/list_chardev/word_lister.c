@@ -96,55 +96,63 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 	return 0;
 }
 
-// TODO: implement transaction semantics
-// TODO: because list is local and does not get attached to shared one on
-// failure, there are leaks on failure atm
-static int lcd_enlist_words(struct list_head *lst, struct file *filp, const char *buf, size_t buf_size)
-{
+static int lcd_enlist_words(struct list_head *list, struct file *filp, const char *buf, size_t buf_size) {
 	pr_debug("called\n");
 
-	size_t idx = 0;
-	size_t wstart = 0;
+	LIST_HEAD(tmp_list);
 	int ret = 0;
-	struct lcd_word *new_word;
-	struct lcd_word *prefix = filp->private_data;
-	filp->private_data = NULL;
+	int idx = 0;
+	int wstart = 0;
+	struct lcd_word *new_word = NULL;
+	struct lcd_word *prefix;
+	struct lcd_word *e;
+	struct lcd_word *n;
 
-	while (idx < buf_size && !isspace((unsigned char)buf[idx])) {
-		++idx;
-	}
-	ret = lcd_word_make(&new_word, prefix ? prefix->word : NULL,
-			    prefix ? prefix->len : 0, buf, idx);
-	if (ret)
-		return ret;
-	kfree(prefix);
+	if (filp->private_data) {
+		prefix = filp->private_data;
 
-	if (idx == buf_size) {
-		filp->private_data = new_word;
-		return ret;
+		while (idx < buf_size && !isspace((unsigned char)buf[idx]))
+			++idx;
+
+		ret = lcd_word_make(&new_word, prefix->word, prefix->len, buf, idx);
+		if (ret)
+			goto failure;
+
+		if (idx == buf_size)
+			goto success;
+
+		list_add_tail(&new_word->node, &tmp_list);
 	}
-	if (new_word)
-		list_add_tail(&new_word->node, lst);
 
 	while (idx < buf_size) {
 		new_word = NULL;
 		while (idx < buf_size && isspace((unsigned char)buf[idx]))
 			++idx;
 		if (idx == buf_size)
-			return ret;
+			goto success;
 		wstart = idx;
 		while (idx < buf_size && !isspace((unsigned char)buf[idx]))
 			++idx;
 		ret = lcd_word_make(&new_word, buf + wstart, idx - wstart, NULL,
 				    0);
 		if (ret)
-			return ret;
+			goto failure;
 		if (idx == buf_size)
-			break;
-		list_add_tail(&new_word->node, lst);
+			goto success;
+		list_add_tail(&new_word->node, &tmp_list);
 	}
-	filp->private_data = new_word;
+	goto success;
 
+failure:
+	list_for_each_entry_safe(e, n, &tmp_list, node) {
+		list_del(&e->node);
+		kfree(e);
+	}
+	return ret;
+success:
+	kfree(filp->private_data);
+	filp->private_data = new_word;
+	list_splice_tail(&tmp_list, list);
 	return ret;
 }
 
