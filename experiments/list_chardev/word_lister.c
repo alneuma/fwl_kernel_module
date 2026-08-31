@@ -4,7 +4,7 @@
 // Instead this simply causes the whole list to be written to the kernel logs.
 //
 // A word is considered to be any number of consecutive bytes
-// such that for each byte b hold !isspace(b).
+// such that for each byte b holds: !isspace(b) or b == 0x0.
 //
 // Word boundaries are preserved between different calls to write().
 // Different open file descriptions have independent word boundaries.
@@ -28,6 +28,7 @@
 #include <linux/ctype.h>
 #include <linux/mutex.h>
 #include <linux/errno.h>
+#include <linux/overflow.h>
 
 #define LCD_DRIVER_NAME "word_lister"
 #define LCD_MAX_WRITE 4096
@@ -49,7 +50,13 @@ static struct cdev list_chardev;
 static struct class *cls;
 static LIST_HEAD(word_list);
 
-static void lcd_word_list_clear(struct list_head *list) {
+static int lcd_word_delim(char c)
+{
+	return isspace((unsigned char)c) || c == 0x0;
+}
+
+static void lcd_word_list_clear(struct list_head *list)
+{
 	struct lcd_word *e;
 	struct lcd_word *n;
 
@@ -63,7 +70,7 @@ static void lcd_log_word(const struct lcd_word *word, size_t num)
 {
 	// Theoretical possiblity; actual kmalloc() size is limited
 	const int log_len = (int)min(word->len, (size_t)INT_MAX);
-	printk("node %zu: %.*s\n", num, log_len, word->word);
+	pr_info("node %zu: %.*s\n", num, log_len, word->word);
 }
 
 static void lcd_log_list(void)
@@ -160,7 +167,7 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	mutex_lock(&file_data->lock);
 
 	if (file_data->word) {
-		while (idx < buf_size && !isspace((unsigned char)buf[idx]))
+		while (idx < buf_size && !lcd_word_delim(buf[idx]))
 			++idx;
 
 		ret = lcd_word_make(&new_word, file_data->word->word,
@@ -176,12 +183,12 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 
 	while (idx < buf_size) {
 		new_word = NULL;
-		while (idx < buf_size && isspace((unsigned char)buf[idx]))
+		while (idx < buf_size && lcd_word_delim(buf[idx]))
 			++idx;
 		if (idx == buf_size)
 			goto success;
 		wstart = idx;
-		while (idx < buf_size && !isspace((unsigned char)buf[idx]))
+		while (idx < buf_size && !lcd_word_delim(buf[idx]))
 			++idx;
 		ret = lcd_word_make(&new_word, buf + wstart, idx - wstart, NULL,
 				    0);
@@ -255,6 +262,7 @@ static int lcd_release(struct inode *inode, struct file *filp)
 
 	struct lcd_file *file_data = filp->private_data;
 	struct lcd_word *word = file_data->word;
+	file_data->word = NULL;
 
 	if (word) {
 		mutex_lock(&lcd_mutex);
@@ -334,10 +342,7 @@ static void __exit lcd_exit(void)
 	class_destroy(cls);
 	cdev_del(&list_chardev);
 	unregister_chrdev_region(devt, 1);
-
-	mutex_lock(&lcd_mutex);
 	lcd_word_list_clear(&word_list);
-	mutex_unlock(&lcd_mutex);
 
 	pr_info("%s removed successfully\n", LCD_DRIVER_NAME);
 }
