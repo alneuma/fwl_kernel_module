@@ -1,10 +1,21 @@
+// This toy kernel module implements a character device that enqueues all words
+// written to it in a list.
+// Reading from the device does not work one would expect.
+// Instead this simply causes the whole list to be written to the kernel logs.
+//
 // A word is considered to be any number of consecutive bytes
 // such that for each byte b hold !isspace(b).
 //
 // Word boundaries are preserved between different calls to write()
-// and per call to open().
+// and per open file description.
 //
-// release() adds unfinished words to the list.
+// Only per open file description completed words are added to the list.
+//
+// On release() the last uncompleted word is considered to be completed.
+//
+// Currently word size as well as list size are unbounded.
+// Buffer size is limited to 4096.
+//
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
 #include <linux/module.h>
@@ -41,9 +52,7 @@ static LIST_HEAD(word_list);
 
 static void lcd_log_word(const struct lcd_word *word, size_t num)
 {
-	pr_debug("called\n");
-
-	// Theoretical possiblity but actual kmalloc() size is hardware limited
+	// Theoretical possiblity; actual kmalloc() size is limited
 	const int log_len = (int)min(word->len, (size_t)INT_MAX);
 	printk("node %zu: %.*s\n", num, log_len, word->word);
 }
@@ -64,6 +73,11 @@ static void lcd_log_list(void)
 	mutex_unlock(&lcd_mutex);
 }
 
+// lcd_read()
+//
+// Currently this logs the list to the kernel logs.
+//
+// TODO: implement real read behavior
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
 {
@@ -76,11 +90,12 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 // lcd_word_make()
 // composes a new word from prefix and suffix
 //
-// prefix_len + suffix_len == 0 -> word of length 0 will be created
-//
 // return values:
 // success -> 0
 // failure -> error < 0
+//
+// checked runtime errors:
+// prefix_len + suffix_len == 0 -> -EINVAL
 //
 // unchecked runtime errors:
 // prefix == NULL && prefix_len > 0
@@ -91,10 +106,12 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 {
 	pr_debug("called\n");
 
-	if (prefix_len > SIZE_MAX - suffix_len)
+	size_t len;
+	if (check_add_overflow(prefix_len, suffix_len, &len))
 		return -EOVERFLOW;
 
-	const size_t len = prefix_len + suffix_len;
+	if (!len)
+		return -EINVAL;
 
 	const size_t size = struct_size(*new_word, word, len);
 	if (size == SIZE_MAX)
@@ -119,8 +136,7 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 // if there is an unfinished word at the end of the buffer it will be saved
 // in the struct lcd_word in filp->private_data.
 //
-// Is transactionally safe, i.e. in case of failure list and filp will not be
-// modified.
+// On failure filp and list will stay unmodified.
 static int lcd_enlist_words(struct list_head *list, struct file *filp,
 			    const char *buf, size_t buf_size)
 {
@@ -169,17 +185,17 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 		list_add_tail(&new_word->node, list);
 	}
 
-failure:
-	list_for_each_entry_safe(e, n, list, node) {
-		list_del(&e->node);
-		kfree(e);
-	}
-	new_word = file_data->word;
-	file_data->word = NULL;
 success:
 	kfree(file_data->word);
 	file_data->word = new_word;
 	mutex_unlock(&file_data->lock);
+	return 0;
+failure:
+	mutex_unlock(&file_data->lock);
+	list_for_each_entry_safe(e, n, list, node) {
+		list_del(&e->node);
+		kfree(e);
+	}
 	return ret;
 }
 
@@ -202,6 +218,7 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 		return PTR_ERR(devbuf);
 
 	ret = lcd_enlist_words(&tmp_list, filp, devbuf, count);
+	kfree(devbuf);
 	if (ret)
 		return ret;
 
@@ -210,6 +227,7 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 	mutex_unlock(&lcd_mutex);
 
 	return count;
+
 }
 
 static int lcd_open(struct inode *inode, struct file *filp)
@@ -233,13 +251,14 @@ static int lcd_release(struct inode *inode, struct file *filp)
 
 	struct lcd_file *file_data = filp->private_data;
 	struct lcd_word *word = file_data->word;
-	kfree(filp->private_data);
 
 	if (word) {
 		mutex_lock(&lcd_mutex);
 		list_add_tail(&word->node, &word_list);
 		mutex_unlock(&lcd_mutex);
 	}
+
+	kfree(filp->private_data);
 
 	return 0;
 }
