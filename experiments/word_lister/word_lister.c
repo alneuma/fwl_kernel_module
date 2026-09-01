@@ -219,6 +219,7 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 		while (idx < buf_size && !lcd_word_delim(buf[idx]))
 			++idx;
 
+		// does the file_data->word access need to be ofd protected?
 		ret = lcd_word_make(&new_word, file_data->word->word,
 				    file_data->word->len, buf, idx);
 		if (ret)
@@ -249,6 +250,7 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	}
 
 success:
+	// does the file_data->word access need to be ofd protected?
 	kfree(file_data->word);
 	file_data->word = new_word;
 	mutex_unlock(&file_data->lock);
