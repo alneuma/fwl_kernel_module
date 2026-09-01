@@ -2,7 +2,7 @@
 // written to it in a list.
 //
 // A word is considered to be any number of consecutive bytes
-// such that for each byte b holds: !isspace(b) or b == 0x0.
+// such that for each byte b holds: !isspace(b) or b == 0x0 or WORD_SEP
 //
 // Word boundaries are preserved between different calls to write().
 // Different open file descriptions have independent word boundaries.
@@ -31,7 +31,7 @@
 
 #define LCD_DRIVER_NAME "word_lister"
 #define LCD_MAX_WRITE 4096
-#define READ_WORD_SEP ' '
+#define WORD_SEP ' '
 
 struct lcd_word {
 	struct list_head node;
@@ -53,7 +53,8 @@ static LIST_HEAD(word_list);
 
 static int lcd_word_delim(char c)
 {
-	return isspace((unsigned char)c) || c == 0x0;
+	// in case WORD_SEP is not within the set defined by isspace()
+	return isspace((unsigned char)c) || c == 0x0 || c == WORD_SEP;
 }
 
 static void lcd_word_list_clear(struct list_head *list)
@@ -93,8 +94,90 @@ static int nothing_to_read(struct lcd_file *file_data, loff_t pos)
 	return 0;
 }
 
-
+// returnes words joined with a single byte: WORD_SEP
+// *f_pos represents the position within this join
+//
+// A read will never end with WORD_SEP
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
+			loff_t *f_pos) {
+
+	struct lcd_file *ofd_data = filp->private_data;
+	struct lcd_word *e;
+	char *tmp_buf;
+	loff_t pos;
+	loff_t wrd_idx;
+	loff_t buf_idx = 0;
+	size_t copy_size;
+	int ret = 0;
+
+	if (!count)
+		return 0;
+
+	if (count > LCD_MAX_WRITE)
+		return -E2BIG;
+
+	tmp_buf = kmalloc(count, GFP_KERNEL);
+	if (!tmp_buf)
+		return -ENOMEM;
+
+	mutex_lock(&lcd_mutex);
+	mutex_lock(&ofd_data->lock);
+
+	// This check could potentially be moved before buffer allocation.
+	// But this would increase locking complexity.
+	if (list_empty(&word_list))
+		goto done;
+
+	struct list_head *pos_lst = word_list.next;
+
+	// loop invariants:
+	// pos == amount of bytes before(!) the word at pos_list
+	//        if words were joined by a single byte
+	// pos < *f_pos
+	// pos_lst has not wrapped around
+	pos = 0;
+	while (pos_lst != &word_list) {
+		e = list_entry(pos_lst, struct lcd_word, node);
+		pos += e->len + 1;
+		if (pos >= *f_pos)
+			break;
+		pos_lst = pos_lst->next;
+	}
+	if (pos_lst == &word_list) // we have wrapped around
+		goto done;
+	if (pos > *f_pos) { // write first potentially partial word
+		wrd_idx = *f_pos - pos;
+		copy_size = min(e->len - wrd_idx, count - buf_idx);
+		memcpy(buf + buf_idx, e->word + wrd_idx, copy_size);
+		buf_idx += copy_size;
+		*f_pos += copy_size;
+	} 
+	pos_lst = pos_lst->next;
+
+	// loop invariants:
+	// *f_pos == amount of bytes before(!) the word at pos_list
+	//           if words were joined by a single byte
+	// buf_idx < count;
+	// pos_lst has not wrapped around
+	while (buf_idx < count && pos_lst != &word_list) {
+		tmp_buf[buf_idx++] = WORD_SEP;
+		++*f_pos;
+		if (buf_idx == count)
+			goto done;
+	}
+
+done:
+	mutex_unlock(&ofd_data->lock);
+	mutex_unlock(&lcd_mutex);
+
+	ret = copy_to_user(buf, tmp_buf, buf_idx);
+	kfree(tmp_buf);
+
+	return ret ? ret : buf_idx;
+}
+
+
+static ssize_t lcd_read_old(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
 {
 	pr_debug("called");
@@ -133,7 +216,7 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			break;
 		if (list_is_last(&e->node, &word_list))
 			break;
-		tmp_buf[copied_total++] = READ_WORD_SEP;
+		tmp_buf[copied_total++] = WORD_SEP;
 		pos = 0;
 	}
 	mutex_unlock(&lcd_mutex);
