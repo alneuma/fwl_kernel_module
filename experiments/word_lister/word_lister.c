@@ -30,7 +30,7 @@
 #include <linux/overflow.h>
 
 #define LCD_DRIVER_NAME "word_lister"
-#define LCD_MAX_WRITE 4096
+#define LCD_MAX_WRITE 8
 #define WORD_SEP ' '
 
 struct lcd_word {
@@ -96,9 +96,6 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	if (!count)
 		return 0;
 
-	// if (count > LCD_MAX_WRITE)
-	// 	return -E2BIG;
-
 	tmp_buf = kmalloc(count, GFP_KERNEL);
 	if (!tmp_buf)
 		return -ENOMEM;
@@ -123,6 +120,7 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	pos = 0;
 	while (pos_lst != &word_list) {
 		e = list_entry(pos_lst, struct lcd_word, node);
+		pr_debug("in word: %.*s\n", (int)e->len, e->word);
 		pos += e->len + 1;
 		if (pos >= *f_pos)
 			break;
@@ -151,10 +149,12 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 		++*f_pos;
 		if (buf_idx == count)
 			goto done;
+		e = list_entry(pos_lst, struct lcd_word, node);
 		copy_size = min(e->len, count - buf_idx);
 		memcpy(tmp_buf + buf_idx, e->word, copy_size);
 		*f_pos += copy_size;
 		buf_idx += copy_size;
+		pos_lst = pos_lst->next;
 	}
 
 done:
@@ -286,9 +286,6 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 
 	if (!count)
 		return 0;
-
-	if (count > LCD_MAX_WRITE)
-		return -E2BIG;
 
 	char *devbuf = memdup_user(buf, count);
 	if (IS_ERR(devbuf))
