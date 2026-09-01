@@ -14,6 +14,9 @@
 // Buffer size is limited to 4096.
 // To prevent resource drain this will be changed in future iterations.
 //
+// Currently also arbitrarily large read and write buffers are allowed.
+// This will be changed or appropriately handled in future iterations.
+//
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
 #include <linux/module.h>
@@ -71,8 +74,6 @@ static void lcd_word_list_clear(struct list_head *list)
 // returnes words joined with a single byte: WORD_SEP
 // *f_pos represents the position within this join
 //
-// A read will never end with WORD_SEP
-//
 // Algorithm:
 // I traverse the virtually joined list of words with pos until I pos == *f_pos.
 // Then I start copying from the virtually joined list to the buffer while
@@ -129,7 +130,7 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	if (pos_lst == &word_list) // we have wrapped around
 		goto done;
 	if (pos > *f_pos) { // write first potentially partial word
-		wrd_idx = *f_pos - pos;
+		wrd_idx = *f_pos + e->len - pos;
 		copy_size = min(e->len - wrd_idx, count - buf_idx);
 		memcpy(tmp_buf + buf_idx, e->word + wrd_idx, copy_size);
 		buf_idx += copy_size;
