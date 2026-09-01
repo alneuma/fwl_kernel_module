@@ -83,16 +83,16 @@ static void lcd_word_list_clear(struct list_head *list)
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos) {
 
-	struct lcd_file *ofd_data = filp->private_data;
 	struct lcd_word *e;
 	char *tmp_buf;
+	loff_t f_pos_backup = *f_pos;
 	loff_t pos;
 	loff_t wrd_idx;
 	loff_t buf_idx = 0;
 	size_t copy_size;
 	int ret = 0;
 
-	pr_debug("called");
+	pr_debug("called\n");
 
 	if (!count)
 		return 0;
@@ -102,7 +102,6 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 		return -ENOMEM;
 
 	mutex_lock(&lcd_mutex);
-	mutex_lock(&ofd_data->lock);
 
 	// This check could potentially be moved before buffer allocation.
 	// But this would increase locking complexity.
@@ -121,7 +120,6 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	pos = 0;
 	while (pos_lst != &word_list) {
 		e = list_entry(pos_lst, struct lcd_word, node);
-		pr_debug("in word: %.*s\n", (int)e->len, e->word);
 		pos += e->len + 1;
 		if (pos >= *f_pos)
 			break;
@@ -130,7 +128,7 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	if (pos_lst == &word_list) // we have wrapped around
 		goto done;
 	if (pos > *f_pos) { // write first potentially partial word
-		wrd_idx = *f_pos + e->len - pos;
+		wrd_idx = e->len + 1 - (pos - *f_pos);
 		copy_size = min(e->len - wrd_idx, count - buf_idx);
 		memcpy(tmp_buf + buf_idx, e->word + wrd_idx, copy_size);
 		buf_idx += copy_size;
@@ -159,10 +157,12 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	}
 
 done:
-	mutex_unlock(&ofd_data->lock);
 	mutex_unlock(&lcd_mutex);
 
-	ret = copy_to_user(buf, tmp_buf, buf_idx);
+	if (copy_to_user(buf, tmp_buf, buf_idx)) {
+		*f_pos = f_pos_backup;
+		ret = -EFAULT;
+	}
 	kfree(tmp_buf);
 
 	return ret ? ret : buf_idx;
@@ -185,7 +185,7 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
 			 size_t suffix_len)
 {
-	pr_debug("called");
+	pr_debug("called\n");
 
 	size_t len;
 	if (check_add_overflow(prefix_len, suffix_len, &len))
@@ -221,23 +221,23 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 static int lcd_enlist_words(struct list_head *list, struct file *filp,
 			    const char *buf, size_t buf_size)
 {
-	pr_debug("called");
+	pr_debug("called\n");
 
 	int ret = 0;
 	size_t idx = 0;
 	size_t wstart = 0;
-	struct lcd_file *file_data = filp->private_data;
+	struct lcd_file *ofd_data = filp->private_data;
 	struct lcd_word *new_word = NULL;
 
-	mutex_lock(&file_data->lock);
+	mutex_lock(&ofd_data->lock);
 
-	if (file_data->word) {
+	if (ofd_data->word) {
 		while (idx < buf_size && !lcd_word_delim(buf[idx]))
 			++idx;
 
-		// does the file_data->word access need to be ofd protected?
-		ret = lcd_word_make(&new_word, file_data->word->word,
-				    file_data->word->len, buf, idx);
+		// does the ofd_data->word access need to be ofd protected?
+		ret = lcd_word_make(&new_word, ofd_data->word->word,
+				    ofd_data->word->len, buf, idx);
 		if (ret)
 			goto failure;
 
@@ -266,13 +266,13 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	}
 
 success:
-	// does the file_data->word access need to be ofd protected?
-	kfree(file_data->word);
-	file_data->word = new_word;
-	mutex_unlock(&file_data->lock);
+	// does the ofd_data->word access need to be ofd protected?
+	kfree(ofd_data->word);
+	ofd_data->word = new_word;
+	mutex_unlock(&ofd_data->lock);
 	return 0;
 failure:
-	mutex_unlock(&file_data->lock);
+	mutex_unlock(&ofd_data->lock);
 	lcd_word_list_clear(list);
 	return ret;
 }
@@ -280,7 +280,7 @@ failure:
 static ssize_t lcd_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
-	pr_debug("called");
+	pr_debug("called\n");
 
 	LIST_HEAD(tmp_list);
 	int ret;
@@ -306,15 +306,15 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 
 static int lcd_open(struct inode *inode, struct file *filp)
 {
-	pr_debug("called");
+	pr_debug("called\n");
 
 	// sets file->data->word = NULL
-	struct lcd_file *file_data = kzalloc(sizeof(*file_data), GFP_KERNEL);
-	if (!file_data)
+	struct lcd_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
+	if (!ofd_data)
 		return -ENOMEM;
 
-	mutex_init(&file_data->lock);
-	filp->private_data = file_data;
+	mutex_init(&ofd_data->lock);
+	filp->private_data = ofd_data;
 
 	return 0;
 }
@@ -322,11 +322,11 @@ static int lcd_open(struct inode *inode, struct file *filp)
 // adds unfinished per open words to list
 static int lcd_release(struct inode *inode, struct file *filp)
 {
-	pr_debug("called");
+	pr_debug("called\n");
 
-	struct lcd_file *file_data = filp->private_data;
-	struct lcd_word *word = file_data->word;
-	file_data->word = NULL;
+	struct lcd_file *ofd_data = filp->private_data;
+	struct lcd_word *word = ofd_data->word;
+	ofd_data->word = NULL;
 
 	if (word) {
 		mutex_lock(&lcd_mutex);
@@ -351,11 +351,11 @@ static int __init lcd_init(void)
 {
 	int ret = 0;
 
-	pr_info("initializing %s ...", LCD_DRIVER_NAME);
+	pr_info("initializing %s ...\n", LCD_DRIVER_NAME);
 
 	ret = alloc_chrdev_region(&devt, 0, 1, LCD_DRIVER_NAME);
 	if (ret) {
-		pr_err("failed to initialize %s: alloc_chrdev_region(): %d",
+		pr_err("failed to initialize %s: alloc_chrdev_region(): %d\n",
 		       LCD_DRIVER_NAME, ret);
 		goto alloc_chrdev_region_failed;
 	}
@@ -363,7 +363,7 @@ static int __init lcd_init(void)
 	cdev_init(&list_chardev, &lcd_ops);
 	ret = cdev_add(&list_chardev, devt, 1);
 	if (ret) {
-		pr_err("failed to initialize %s: cdev_add(): %d",
+		pr_err("failed to initialize %s: cdev_add(): %d\n",
 		       LCD_DRIVER_NAME, ret);
 		goto cdev_add_failed;
 	}
@@ -371,7 +371,7 @@ static int __init lcd_init(void)
 	cls = class_create(LCD_DRIVER_NAME); // assumes kernel >= 6.4.0
 	if (IS_ERR(cls)) {
 		ret = PTR_ERR(cls);
-		pr_err("failed to initialize %s: class_create(): %d",
+		pr_err("failed to initialize %s: class_create(): %d\n",
 		       LCD_DRIVER_NAME, ret);
 		goto class_create_failed;
 	}
@@ -380,12 +380,12 @@ static int __init lcd_init(void)
 		device_create(cls, NULL, devt, NULL, LCD_DRIVER_NAME);
 	if (IS_ERR(retp)) {
 		ret = PTR_ERR(retp);
-		pr_err("failed to initialize %s: device_create(): %d",
+		pr_err("failed to initialize %s: device_create(): %d\n",
 		       LCD_DRIVER_NAME, ret);
 		goto device_create_failed;
 	}
 
-	pr_info("%s initialized successfully", LCD_DRIVER_NAME);
+	pr_info("%s initialized successfully\n", LCD_DRIVER_NAME);
 	return 0;
 
 device_create_failed:
@@ -400,7 +400,7 @@ alloc_chrdev_region_failed:
 
 static void __exit lcd_exit(void)
 {
-	pr_info("cleaning up %s ...", LCD_DRIVER_NAME);
+	pr_info("cleaning up %s ...\n", LCD_DRIVER_NAME);
 
 	device_destroy(cls, devt);
 	class_destroy(cls);
@@ -408,7 +408,7 @@ static void __exit lcd_exit(void)
 	unregister_chrdev_region(devt, 1);
 	lcd_word_list_clear(&word_list);
 
-	pr_info("%s removed successfully", LCD_DRIVER_NAME);
+	pr_info("%s removed successfully\n", LCD_DRIVER_NAME);
 }
 
 module_init(lcd_init);
