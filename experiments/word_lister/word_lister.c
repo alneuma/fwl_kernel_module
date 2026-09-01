@@ -68,36 +68,17 @@ static void lcd_word_list_clear(struct list_head *list)
 	}
 }
 
-static size_t lcd_copy_word(const struct lcd_word *word, size_t pos, char *buf,
-			    size_t buf_size)
-{
-	size_t copy_size = min(word->len - pos, buf_size);
-	memcpy(buf, word->word + pos, copy_size);
-	return copy_size;
-}
-
-static int nothing_to_read(struct lcd_file *file_data, loff_t pos)
-{
-	struct lcd_word *e;
-
-	mutex_lock(&lcd_mutex);
-	if (file_data->cur_read &&
-	    list_is_last(file_data->cur_read, &word_list)) {
-		e = container_of_const(file_data->cur_read, struct lcd_word,
-				       node);
-		if (pos == e->len) {
-			mutex_unlock(&lcd_mutex);
-			return 1;
-		}
-	}
-	mutex_unlock(&lcd_mutex);
-	return 0;
-}
-
 // returnes words joined with a single byte: WORD_SEP
 // *f_pos represents the position within this join
 //
 // A read will never end with WORD_SEP
+//
+// Algorithm:
+// I traverse the virtually joined list of words with pos until I pos == *f_pos.
+// Then I start copying from the virtually joined list to the buffer while
+// increasing *f_pos.
+// I say "virtually joined" because while traversing I do not literally join the
+// word of the list except in the moment I copy them to the buffer.
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos) {
 
@@ -110,11 +91,13 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	size_t copy_size;
 	int ret = 0;
 
+	pr_debug("called");
+
 	if (!count)
 		return 0;
 
-	if (count > LCD_MAX_WRITE)
-		return -E2BIG;
+	// if (count > LCD_MAX_WRITE)
+	// 	return -E2BIG;
 
 	tmp_buf = kmalloc(count, GFP_KERNEL);
 	if (!tmp_buf)
@@ -130,6 +113,8 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 
 	struct list_head *pos_lst = word_list.next;
 
+	// traverse the list until the word to which *f_pos belongs
+	//
 	// loop invariants:
 	// pos == amount of bytes before(!) the word at pos_list
 	//        if words were joined by a single byte
@@ -148,12 +133,14 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	if (pos > *f_pos) { // write first potentially partial word
 		wrd_idx = *f_pos - pos;
 		copy_size = min(e->len - wrd_idx, count - buf_idx);
-		memcpy(buf + buf_idx, e->word + wrd_idx, copy_size);
+		memcpy(tmp_buf + buf_idx, e->word + wrd_idx, copy_size);
 		buf_idx += copy_size;
 		*f_pos += copy_size;
 	} 
 	pos_lst = pos_lst->next;
 
+	// write remaining words
+	//
 	// loop invariants:
 	// *f_pos == amount of bytes before(!) the word at pos_list
 	//           if words were joined by a single byte
@@ -164,6 +151,10 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 		++*f_pos;
 		if (buf_idx == count)
 			goto done;
+		copy_size = min(e->len, count - buf_idx);
+		memcpy(tmp_buf + buf_idx, e->word, copy_size);
+		*f_pos += copy_size;
+		buf_idx += copy_size;
 	}
 
 done:
@@ -174,65 +165,6 @@ done:
 	kfree(tmp_buf);
 
 	return ret ? ret : buf_idx;
-}
-
-
-static ssize_t lcd_read_old(struct file *filp, char __user *buf, size_t count,
-			loff_t *f_pos)
-{
-	pr_debug("called");
-
-	struct lcd_file *file_data = filp->private_data;
-	struct list_head *start = &word_list;
-	struct lcd_word *e;
-	struct list_head *anchor;
-	loff_t pos;
-	size_t copied_total = 0;
-	size_t copied = 0;
-
-	if (nothing_to_read(file_data, *f_pos))
-		return 0;
-
-	char *tmp_buf = kmalloc(count, GFP_KERNEL);
-	if (!tmp_buf)
-		return -ENOMEM;
-
-	mutex_lock(&lcd_mutex);
-	pos = *f_pos;
-	anchor = file_data->cur_read;
-
-	if (anchor)
-		start = anchor;
-
-	list_for_each_entry(e, start, node) {
-		anchor = &e->node;
-		if (copied_total == count)
-			break;
-		copied = lcd_copy_word(e, pos, tmp_buf + copied_total,
-				       count - copied_total);
-		copied_total += copied;
-		pos += copied;
-		if (copied_total == count)
-			break;
-		if (list_is_last(&e->node, &word_list))
-			break;
-		tmp_buf[copied_total++] = WORD_SEP;
-		pos = 0;
-	}
-	mutex_unlock(&lcd_mutex);
-
-	if (copy_to_user(buf, tmp_buf, copied_total)) {
-		kfree(tmp_buf);
-		return -EFAULT;
-	}
-	kfree(tmp_buf);
-
-	mutex_lock(&file_data->lock);
-	*f_pos = pos;
-	file_data->cur_read = anchor;
-	mutex_unlock(&file_data->lock);
-
-	return copied_total;
 }
 
 // lcd_word_make()
