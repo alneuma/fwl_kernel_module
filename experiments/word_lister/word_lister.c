@@ -49,6 +49,9 @@ struct lcd_word {
 	char word[];
 };
 
+/*
+ * node_it currently has no function but will be relevant in future iterations.
+ */
 struct lcd_read_pos {
 	struct list_head *node_ptr;
 	u64 node_id;
@@ -67,14 +70,67 @@ static struct cdev list_chardev;
 static struct class *cls;
 static LIST_HEAD(word_list);
 
+/*
+ * lcd_pos_upadte();
+ *
+ * This will be more sophisticated in future iterations,
+ * when nodes can disappear from the start of the list.
+ */
 static void lcd_pos_update(struct lcd_read_pos *pos)
 {
+	if (!pos->node_ptr) {
+		pos->node_ptr = word_list.next;
+		pos->node_id = 0;
+		pos->word_pos = 0;
+	}
+	return;
 }
 
-static size_t lcd_read_from_pos(struct lcd_read_pos *pos, char *tmp_buf,
+static size_t lcd_read_from_pos(struct lcd_read_pos *pos, char *buf,
 				size_t count)
 {
-	return 0;
+	struct lcd_word *e;
+	size_t copy_size;
+	size_t idx = 0;
+
+	e = list_entry(pos->node_ptr, struct lcd_word, node);
+
+	/* write first word */
+	if (pos->word_pos < e->len) {
+		copy_size = min(e->len - pos->word_pos, count);
+		memcpy(buf, e->word + pos->word_pos, copy_size);
+		idx += copy_size;
+		pos->word_pos += copy_size;
+	}
+	if (idx == count)
+		return idx;
+
+	/* write separator */
+	if (!list_is_last(pos->node_ptr, &word_list)) {
+		buf[idx++] = WORD_SEP;
+		pos->word_pos = 0;
+		pos->node_ptr = pos->node_ptr->next;
+	} else
+		return idx;
+
+	/* write remaining */
+	while (idx < count) {
+		e = list_entry(pos->node_ptr, struct lcd_word, node);
+		copy_size = min(e->len, count - idx);
+		memcpy(buf, e->word + pos->word_pos, copy_size);
+		idx += copy_size;
+		pos->word_pos = copy_size;
+		if (idx == count)
+			return idx;
+		if (!list_is_last(pos->node_ptr, &word_list)) {
+			buf[idx++] = WORD_SEP;
+			pos->word_pos = 0;
+			pos->node_ptr = pos->node_ptr->next;
+		} else
+			return idx;
+	}
+
+	return idx;
 }
 
 /*
@@ -105,6 +161,12 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	pos = ofd_data->pos;
 
 	mutex_lock(&lcd_mutex);
+
+	if (list_empty(&word_list)) {
+		mutex_unlock(&lcd_mutex);
+		mutex_unlock(&ofd_data->lock);
+		return 0;
+	}
 
 	lcd_pos_update(&pos);
 	total_read = lcd_read_from_pos(&pos, tmp_buf, count);
