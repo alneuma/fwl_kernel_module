@@ -4,6 +4,12 @@
  *
  * A word is considered to be any number of consecutive bytes
  * such that for each byte b holds: !isspace(b) or b == 0x0 or WORD_SEP
+ *
+ * f_pos is unused for read() and write().
+ *
+ * When read from it, the device does not preserve the characters of the
+ * original word boundaries. Instead all the words are separated by a single
+ * WORD_SEP byte when read.
  * 
  * Word boundaries are preserved between different calls to write().
  * Different open file descriptions have independent word boundaries.
@@ -17,6 +23,10 @@
  * Currently also arbitrarily large read and write buffers are allowed.
  * This will be changed or appropriately handled in future iterations.
  *
+ * Design consideration:
+ * Should read on empty list return EOF or do something else?
+ * atm it return EOF
+ * consider blocking/-EAGAIN for blocking/non-blocking reads
  *
  * mutex lock order:
  *
@@ -49,17 +59,13 @@ struct lcd_word {
 	char word[];
 };
 
-/*
- * node_id currently has no function but will be relevant in future iterations.
- */
-struct lcd_read_pos {
-	struct list_head *node_ptr;
-	u64 node_id;
+struct lcd_cursor {
+	struct list_head *ptr;
 	size_t word_pos;
 };
 
 struct lcd_file {
-	struct lcd_read_pos pos;
+	struct lcd_cursor pos;
 	struct mutex lock;
 	struct lcd_word *stash;
 };
@@ -70,30 +76,31 @@ static struct cdev list_chardev;
 static struct class *cls;
 static LIST_HEAD(word_list);
 
-/*
- * lcd_pos_upadte();
- *
- * This will be more sophisticated in future iterations,
- * when nodes can disappear from the start of the list.
- */
-static void lcd_pos_update(struct lcd_read_pos *pos)
+static void lcd_pos_update(struct lcd_cursor *pos)
 {
-	if (!pos->node_ptr) {
-		pos->node_ptr = word_list.next;
-		pos->node_id = 0;
+	if (!pos->ptr) {
+		pos->ptr = word_list.next;
 		pos->word_pos = 0;
 	}
 	return;
 }
 
-static size_t lcd_read_from_pos(struct lcd_read_pos *pos, char *buf,
+/*
+ * lcd_read_from_pos()
+ *
+ * assumptions:
+ * - lcd_mutex held
+ * - word_list not empty
+ * - pos->ptr != NULL && !(pos->ptr == &word_list)
+ */
+static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf,
 				size_t count)
 {
 	struct lcd_word *e;
 	size_t copy_size;
 	size_t idx = 0;
 
-	e = list_entry(pos->node_ptr, struct lcd_word, node);
+	e = list_entry(pos->ptr, struct lcd_word, node);
 
 	/* write first word */
 	if (pos->word_pos < e->len) {
@@ -106,26 +113,26 @@ static size_t lcd_read_from_pos(struct lcd_read_pos *pos, char *buf,
 		return idx;
 
 	/* write separator */
-	if (!list_is_last(pos->node_ptr, &word_list)) {
+	if (!list_is_last(pos->ptr, &word_list)) {
 		buf[idx++] = WORD_SEP;
 		pos->word_pos = 0;
-		pos->node_ptr = pos->node_ptr->next;
+		pos->ptr = pos->ptr->next;
 	} else
 		return idx;
 
 	/* write remaining */
 	while (idx < count) {
-		e = list_entry(pos->node_ptr, struct lcd_word, node);
+		e = list_entry(pos->ptr, struct lcd_word, node);
 		copy_size = min(e->len, count - idx);
 		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
 		idx += copy_size;
 		pos->word_pos = copy_size;
 		if (idx == count)
 			return idx;
-		if (!list_is_last(pos->node_ptr, &word_list)) {
+		if (!list_is_last(pos->ptr, &word_list)) {
 			buf[idx++] = WORD_SEP;
 			pos->word_pos = 0;
-			pos->node_ptr = pos->node_ptr->next;
+			pos->ptr = pos->ptr->next;
 		} else
 			return idx;
 	}
@@ -141,7 +148,9 @@ static size_t lcd_read_from_pos(struct lcd_read_pos *pos, char *buf,
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos) {
 
-	struct lcd_read_pos pos;
+	(void)f_pos;
+
+	struct lcd_cursor pos;
 	char *tmp_buf;
 	int ret = 0;
 	size_t total_read;
@@ -351,6 +360,8 @@ failure:
 static ssize_t lcd_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
+	(void)f_pos;
+
 	pr_debug("called\n");
 
 	LIST_HEAD(tmp_list);
@@ -402,12 +413,12 @@ static int lcd_release(struct inode *inode, struct file *filp)
 	pr_debug("called\n");
 
 	struct lcd_file *ofd_data = filp->private_data;
-	struct lcd_word *word = ofd_data->stash;
+	struct lcd_word *stash = ofd_data->stash;
 	ofd_data->stash = NULL;
 
-	if (word) {
+	if (stash) {
 		mutex_lock(&lcd_mutex);
-		list_add_tail(&word->node, &word_list);
+		list_add_tail(&stash->node, &word_list);
 		mutex_unlock(&lcd_mutex);
 	}
 
