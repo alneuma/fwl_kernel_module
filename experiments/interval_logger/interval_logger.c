@@ -19,20 +19,47 @@
 #include <linux/workqueue.h>
 
 #define ILOG_DRIVER_NAME "interval_logger"
+#define LOG_INTERVAL HZ
 
 static DEFINE_MUTEX(ilog_mutex);
 static dev_t devt;
 static struct cdev interval_logger;
 static struct class *cls;
 static struct delayed_work work;
+static unsigned long next_log;
 
 static char *message = "Wazzup?";
 
-static void work_handler(struct work_struct *work)
+/* 
+ * ilog_work_handler()
+ *
+ * To counteract time drift the scheduling delay is calculated by subtracting
+ * the current time from the ideal execution time of the next work item.
+ *
+ * If the actual time is already past this ideal execution time, the delay is
+ * set to 0.
+ */
+static void ilog_work_handler(struct work_struct *work)
 {
+	struct delayed_work *dwork;
+	unsigned long delay;
+
 	pr_info("%s\n", message);
-	struct delayed_work *dwork = to_delayed_work(work);
-	schedule_delayed_work(dwork, HZ);
+
+	dwork = to_delayed_work(work);
+	next_log += LOG_INTERVAL;
+	delay = next_log - jiffies;
+	schedule_delayed_work(dwork, delay > LOG_INTERVAL ? 0 : delay);
+}
+
+static void ilog_start_log(void)
+{
+	if (schedule_delayed_work(&work, LOG_INTERVAL)) {
+		next_log = jiffies + LOG_INTERVAL;
+		pr_info("scheduled work item\n");
+	}
+	else
+		pr_info("work item already pending\n");
 }
 
 /*
@@ -42,10 +69,7 @@ static int ilog_open(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	if (schedule_delayed_work(&work, HZ))
-		pr_info("work item scheduled successfully\n");
-	else
-		pr_info("work item already pending\n");
+	ilog_start_log();
 
 	return 0;
 }
@@ -93,7 +117,7 @@ static int __init ilog_init(void)
 
 	int ret = 0;
 
-	INIT_DELAYED_WORK(&work, work_handler);
+	INIT_DELAYED_WORK(&work, ilog_work_handler);
 
 	ret = alloc_chrdev_region(&devt, 0, 1, ILOG_DRIVER_NAME);
 	if (ret) {
