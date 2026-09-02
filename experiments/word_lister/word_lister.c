@@ -50,7 +50,7 @@ struct lcd_word {
 };
 
 /*
- * node_it currently has no function but will be relevant in future iterations.
+ * node_id currently has no function but will be relevant in future iterations.
  */
 struct lcd_read_pos {
 	struct list_head *node_ptr;
@@ -117,7 +117,7 @@ static size_t lcd_read_from_pos(struct lcd_read_pos *pos, char *buf,
 	while (idx < count) {
 		e = list_entry(pos->node_ptr, struct lcd_word, node);
 		copy_size = min(e->len, count - idx);
-		memcpy(buf, e->word + pos->word_pos, copy_size);
+		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
 		idx += copy_size;
 		pos->word_pos = copy_size;
 		if (idx == count)
