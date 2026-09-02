@@ -68,9 +68,6 @@ static void ilog_start_log(void)
 static int ilog_open(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
-
-	ilog_start_log();
-
 	return 0;
 }
 
@@ -90,6 +87,7 @@ static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
 {
 	pr_debug("called\n");
+	(void)cancel_delayed_work_sync(&work);
 	return 0;
 }
 
@@ -100,6 +98,7 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
 	pr_debug("called\n");
+	ilog_start_log();
 	return count;
 }
 
