@@ -1,21 +1,22 @@
-// This toy kernel module implements a character device that enqueues all words
-// written to it in a list.
-//
-// A word is considered to be any number of consecutive bytes
-// such that for each byte b holds: !isspace(b) or b == 0x0 or WORD_SEP
-//
-// Word boundaries are preserved between different calls to write().
-// Different open file descriptions have independent word boundaries.
-// Only per open file description completed words are added to the list.
-//
-// On release() the last uncompleted word is considered to be completed.
-//
-// Currently word size as well as list size are unbounded.
-// To prevent resource drain this will be changed in future iterations.
-//
-// Currently also arbitrarily large read and write buffers are allowed.
-// This will be changed or appropriately handled in future iterations.
-//
+/*
+ * This toy kernel module implements a character device that enqueues all words
+ * written to it in a list.
+ *
+ * A word is considered to be any number of consecutive bytes
+ * such that for each byte b holds: !isspace(b) or b == 0x0 or WORD_SEP
+ * 
+ * Word boundaries are preserved between different calls to write().
+ * Different open file descriptions have independent word boundaries.
+ * Only per open file description completed words are added to the list.
+ * 
+ * On release() the last uncompleted word is considered to be completed.
+ * 
+ * Currently word size as well as list size are unbounded.
+ * To prevent resource drain this will be changed in future iterations.
+ * 
+ * Currently also arbitrarily large read and write buffers are allowed.
+ * This will be changed or appropriately handled in future iterations.
+ */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
 #include <linux/module.h>
@@ -52,9 +53,14 @@ static struct cdev list_chardev;
 static struct class *cls;
 static LIST_HEAD(word_list);
 
+/*
+ * lcd_word_delim()
+ *
+ * In case WORD_SEP is not within the set defined by isspace(),
+ * c == WORD_SEP is separately checked.
+ */
 static int lcd_word_delim(char c)
 {
-	// in case WORD_SEP is not within the set defined by isspace()
 	return isspace((unsigned char)c) || c == 0x0 || c == WORD_SEP;
 }
 
@@ -69,15 +75,19 @@ static void lcd_word_list_clear(struct list_head *list)
 	}
 }
 
-// returnes words joined with a single byte: WORD_SEP
-// *f_pos represents the position within this join
-//
-// Algorithm:
-// I traverse the virtually joined list of words with pos until I pos == *f_pos.
-// Then I start copying from the virtually joined list to the buffer while
-// increasing *f_pos.
-// I say "virtually joined" because while traversing I do not literally join the
-// word of the list except in the moment I copy them to the buffer.
+/*
+ * lcd_read()
+ *
+ * returnes words joined with a single byte: WORD_SEP
+ * *f_pos represents the position within this join
+ *
+ * Algorithm:
+ * I traverse the virtually joined list of words with pos until I pos == *f_pos.
+ * Then I start copying from the virtually joined list to the buffer while
+ * increasing *f_pos.
+ * I say "virtually joined" because while traversing I do not literally join the
+ * word of the list except in the moment I copy them to the buffer.
+ */
 static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos) {
 
@@ -101,20 +111,22 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 
 	mutex_lock(&lcd_mutex);
 
-	// This check could potentially be moved before buffer allocation.
-	// But this would increase locking complexity.
+	/* This check could potentially be moved before buffer allocation.
+	 * But this would increase locking complexity.
+	 */
 	if (list_empty(&word_list))
 		goto done;
 
 	struct list_head *pos_lst = word_list.next;
 
-	// traverse the list until the word to which *f_pos belongs
-	//
-	// loop invariants:
-	// pos == amount of bytes before(!) the word at pos_list
-	//        if words were joined by a single byte
-	// pos < *f_pos
-	// pos_lst has not wrapped around
+	/* traverse the list until the word to which *f_pos belongs
+	 *
+	 * loop invariants:
+	 * pos == amount of bytes before(!) the word at pos_list
+	 *        if words were joined by a single byte
+	 * pos < *f_pos
+	 * pos_lst has not wrapped around
+	 */
 	pos = 0;
 	while (pos_lst != &word_list) {
 		e = list_entry(pos_lst, struct lcd_word, node);
@@ -123,9 +135,9 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 			break;
 		pos_lst = pos_lst->next;
 	}
-	if (pos_lst == &word_list) // we have wrapped around
+	if (pos_lst == &word_list) /* we have wrapped around */
 		goto done;
-	if (pos > *f_pos) { // write first potentially partial word
+	if (pos > *f_pos) { /* write first potentially partial word */
 		wrd_idx = e->len + 1 - (pos - *f_pos);
 		copy_size = min(e->len - wrd_idx, count - buf_idx);
 		memcpy(tmp_buf + buf_idx, e->word + wrd_idx, copy_size);
@@ -134,13 +146,14 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	} 
 	pos_lst = pos_lst->next;
 
-	// write remaining words
-	//
-	// loop invariants:
-	// *f_pos == amount of bytes before(!) the word at pos_list
-	//           if words were joined by a single byte
-	// buf_idx < count;
-	// pos_lst has not wrapped around
+	/* write remaining words
+	 *
+	 * loop invariants:
+	 * *f_pos == amount of bytes before(!) the word at pos_list
+	 *           if words were joined by a single byte
+	 * buf_idx < count;
+	 * pos_lst has not wrapped around
+	 */
 	while (buf_idx < count && pos_lst != &word_list) {
 		tmp_buf[buf_idx++] = WORD_SEP;
 		++*f_pos;
@@ -166,19 +179,21 @@ done:
 	return ret ? ret : buf_idx;
 }
 
-// lcd_word_make()
-// composes a new word from prefix and suffix
-//
-// return values:
-// success -> 0
-// failure -> error < 0
-//
-// checked runtime errors:
-// prefix_len + suffix_len == 0 -> -EINVAL
-//
-// unchecked runtime errors:
-// prefix == NULL && prefix_len > 0
-// suffix == NULL && suffix_len > 0
+/*
+ * lcd_word_make()
+ * composes a new word from prefix and suffix
+ *
+ * return values:
+ * success -> 0
+ * failure -> error < 0
+ *
+ * checked runtime errors:
+ * prefix_len + suffix_len == 0 -> -EINVAL
+ * 
+ * unchecked runtime errors:
+ * prefix == NULL && prefix_len > 0
+ * suffix == NULL && suffix_len > 0
+ */
 static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
 			 size_t suffix_len)
@@ -208,14 +223,16 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 	return 0;
 }
 
-// lcd_enlist_words()
-//
-// If successful words in buf will be appended to list. The struct lcd_word
-// saved in filp->private_data will be considered to be the start of the buffer.
-// if there is an unfinished word at the end of the buffer it will be saved
-// in the struct lcd_word in filp->private_data.
-//
-// On failure filp and list will stay unmodified.
+/*
+ * lcd_enlist_words()
+ * 
+ * If successful words in buf will be appended to list. The struct lcd_word
+ * saved in filp->private_data will be considered to be the start of the buffer.
+ * if there is an unfinished word at the end of the buffer it will be saved
+ * in the struct lcd_word in filp->private_data.
+ *
+ * On failure filp and list will stay unmodified.
+ */
 static int lcd_enlist_words(struct list_head *list, struct file *filp,
 			    const char *buf, size_t buf_size)
 {
@@ -273,7 +290,10 @@ failure:
 	return ret;
 }
 
-/* To prevent an edgecases that would introduce unintuitive word ordering,
+/*
+ * lcd_write()
+ *
+ * To prevent an edgecases that would introduce unintuitive word ordering,
  * ofd_data->lock is only released after the new list segment is commited to
  * the shared list.
  *
@@ -338,7 +358,7 @@ static int lcd_open(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
 
-	// sets file->data->word = NULL
+	/* sets file->data->word = NULL */
 	struct lcd_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
 		return -ENOMEM;
@@ -349,7 +369,7 @@ static int lcd_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-// adds unfinished per open words to list
+/* adds unfinished per open words to list */
 static int lcd_release(struct inode *inode, struct file *filp)
 {
 	pr_debug("called\n");
@@ -398,7 +418,7 @@ static int __init lcd_init(void)
 		goto cdev_add_failed;
 	}
 
-	cls = class_create(LCD_DRIVER_NAME); // assumes kernel >= 6.4.0
+	cls = class_create(LCD_DRIVER_NAME); /* assumes kernel >= 6.4.0 */
 	if (IS_ERR(cls)) {
 		ret = PTR_ERR(cls);
 		pr_err("failed to initialize %s: class_create(): %d\n",
