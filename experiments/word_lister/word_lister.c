@@ -11,7 +11,6 @@
 // On release() the last uncompleted word is considered to be completed.
 //
 // Currently word size as well as list size are unbounded.
-// Buffer size is limited to 4096.
 // To prevent resource drain this will be changed in future iterations.
 //
 // Currently also arbitrarily large read and write buffers are allowed.
@@ -33,7 +32,6 @@
 #include <linux/overflow.h>
 
 #define LCD_DRIVER_NAME "word_lister"
-#define LCD_MAX_WRITE 8
 #define WORD_SEP ' '
 
 struct lcd_word {
@@ -229,13 +227,10 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	struct lcd_file *ofd_data = filp->private_data;
 	struct lcd_word *new_word = NULL;
 
-	mutex_lock(&ofd_data->lock);
-
 	if (ofd_data->word) {
 		while (idx < buf_size && !lcd_word_delim(buf[idx]))
 			++idx;
 
-		// does the ofd_data->word access need to be ofd protected?
 		ret = lcd_word_make(&new_word, ofd_data->word->word,
 				    ofd_data->word->len, buf, idx);
 		if (ret)
@@ -248,35 +243,64 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	}
 
 	while (idx < buf_size) {
+
 		new_word = NULL;
 		while (idx < buf_size && lcd_word_delim(buf[idx]))
 			++idx;
 		if (idx == buf_size)
 			goto success;
+
 		wstart = idx;
 		while (idx < buf_size && !lcd_word_delim(buf[idx]))
 			++idx;
+
 		ret = lcd_word_make(&new_word, buf + wstart, idx - wstart, NULL,
 				    0);
 		if (ret)
 			goto failure;
 		if (idx == buf_size)
 			goto success;
+
 		list_add_tail(&new_word->node, list);
 	}
 
 success:
-	// does the ofd_data->word access need to be ofd protected?
 	kfree(ofd_data->word);
 	ofd_data->word = new_word;
-	mutex_unlock(&ofd_data->lock);
 	return 0;
 failure:
-	mutex_unlock(&ofd_data->lock);
 	lcd_word_list_clear(list);
 	return ret;
 }
 
+/* To prevent an edgecases that would introduce unintuitive word ordering,
+ * ofd_data->lock is only released after the new list segment is commited to
+ * the shared list.
+ *
+ * Consider this:
+ *
+ * Thread A and thread B share one open file description:
+ *
+ * A: writes "Hello W"
+ * B: writes "orld "
+ * A: calls close()
+ * B: calls close()
+ *
+ * If A executes lcd_enlist_words() before B but list_splice_tail_init() after
+ * B, the list
+ *
+ * "World" -- "Hello"
+ *
+ * will be appended to the shared list, which is inconsitent with the order of
+ * bytes in A's write.
+ *
+ * With the mutex protection one of the following will be appended:
+ *
+ * 1. "Hello" -- "World"
+ * 2. "orld" -- "Hello" -- "W"
+ *
+ * Both 1. and 2. are consistent with the byte ordering of individual writes.
+ */
 static ssize_t lcd_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
@@ -284,6 +308,7 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 
 	LIST_HEAD(tmp_list);
 	int ret;
+	struct lcd_file *ofd_data = filp->private_data;
 
 	if (!count)
 		return 0;
@@ -292,14 +317,19 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 	if (IS_ERR(devbuf))
 		return PTR_ERR(devbuf);
 
+	mutex_lock(&ofd_data->lock);
+
 	ret = lcd_enlist_words(&tmp_list, filp, devbuf, count);
 	kfree(devbuf);
 	if (ret)
 		return ret;
 
 	mutex_lock(&lcd_mutex);
+
 	list_splice_tail_init(&tmp_list, &word_list);
+
 	mutex_unlock(&lcd_mutex);
+	mutex_unlock(&ofd_data->lock);
 
 	return count;
 }
