@@ -6,7 +6,7 @@
  * When written to starts periodically logging the first set number of bytes of
  * the write. Consequent writes change what is logged.
  *
- * A reading cancels the logging
+ * A reading cancels the logging and returns EOF.
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -16,13 +16,8 @@
 #include <linux/init.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-#include <linux/slab.h>
-#include <linux/list.h>
-#include <linux/ctype.h>
 #include <linux/mutex.h>
 #include <linux/errno.h>
-#include <linux/overflow.h>
-#include <linux/types.h>
 #include <linux/workqueue.h>
 
 #define ILOG_DRIVER_NAME "interval_logger"
@@ -36,9 +31,8 @@ static struct class *cls;
 static struct delayed_work work;
 static unsigned long next_log;
 static bool logging = false;
-
-char message_buf[MSG_BUFSIZE];
-size_t message_size = 0;
+static char message_buf[MSG_BUFSIZE];
+static size_t message_size = 0;
 
 /* 
  * ilog_work_handler()
@@ -48,6 +42,10 @@ size_t message_size = 0;
  *
  * If the actual time is already past this ideal execution time, the delay is
  * set to 0.
+ *
+ * note:
+ * time_before() uses signed arithmetic to determine the result for
+ * wraparound cases. The half-range rule holds.
  */
 static void ilog_work_handler(struct work_struct *work)
 {
@@ -61,12 +59,17 @@ static void ilog_work_handler(struct work_struct *work)
 		return;
 	}
 
-	pr_info("%.*s\n", (int)message_size, message_buf);
+	pr_info("%*phC\n", (int)message_size, message_buf);
 
 	dwork = to_delayed_work(work);
+
 	next_log += LOG_INTERVAL;
-	delay = next_log - jiffies;
-	schedule_delayed_work(dwork, delay > LOG_INTERVAL ? 0 : delay);
+	if (time_before(next_log, jiffies))
+		delay = 0;
+	else
+		delay = next_log - jiffies;
+
+	schedule_delayed_work(dwork, delay);
 
 	mutex_unlock(&ilog_mutex);
 }
@@ -106,23 +109,6 @@ static int ilog_release(struct inode *inode, struct file *filp)
 }
 
 /*
- * ilog_read()
- */
-static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
-			loff_t *f_pos)
-{
-
-	pr_debug("called\n");
-
-	mutex_lock(&ilog_mutex);
-	logging = false;
-	message_size = 0;
-	mutex_unlock(&ilog_mutex);
-
-	return 0;
-}
-
-/*
  * ilog_write()
  *
  * ilog_start_log() needs to be protected to avoid this:
@@ -144,6 +130,9 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 
 	pr_debug("called\n");
 
+	if (!copy_size)
+		return 0;
+
 	if (copy_from_user(tmp_buf, buf, copy_size)) {
 		mutex_unlock(&ilog_mutex);
 		return -EFAULT;
@@ -158,6 +147,23 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 	return copy_size;
 }
 
+/*
+ * ilog_read()
+ */
+static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
+			loff_t *f_pos)
+{
+
+	pr_debug("called\n");
+
+	mutex_lock(&ilog_mutex);
+	logging = false;
+	message_size = 0;
+	mutex_unlock(&ilog_mutex);
+
+	return 0;
+}
+
 static const struct file_operations ilog_ops = {
 	.owner = THIS_MODULE,
 	.open = ilog_open,
@@ -168,9 +174,10 @@ static const struct file_operations ilog_ops = {
 
 static int __init ilog_init(void)
 {
-	pr_info("initializing %s ...\n", ILOG_DRIVER_NAME);
-
 	int ret = 0;
+	struct device *dev_ptr;
+
+	pr_info("initializing %s ...\n", ILOG_DRIVER_NAME);
 
 	INIT_DELAYED_WORK(&work, ilog_work_handler);
 
@@ -178,7 +185,7 @@ static int __init ilog_init(void)
 	if (ret) {
 		pr_err("failed to initialize %s: alloc_chrdev_region(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto alloc_chrdev_region_failed;
+		goto err_alloc_chrdev_regiond;
 	}
 
 	cdev_init(&interval_logger, &ilog_ops);
@@ -186,36 +193,35 @@ static int __init ilog_init(void)
 	if (ret) {
 		pr_err("failed to initialize %s: cdev_add(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto cdev_add_failed;
+		goto err_cdev_addd;
 	}
 
-	cls = class_create(ILOG_DRIVER_NAME); /* assumes kernel >= 6.4.0 */
+	cls = class_create(ILOG_DRIVER_NAME);
 	if (IS_ERR(cls)) {
 		ret = PTR_ERR(cls);
 		pr_err("failed to initialize %s: class_create(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto class_create_failed;
+		goto err_class_created;
 	}
 
-	struct device *retp =
-		device_create(cls, NULL, devt, NULL, ILOG_DRIVER_NAME);
-	if (IS_ERR(retp)) {
-		ret = PTR_ERR(retp);
+	dev_ptr = device_create(cls, NULL, devt, NULL, ILOG_DRIVER_NAME);
+	if (IS_ERR(dev_ptr)) {
+		ret = PTR_ERR(dev_ptr);
 		pr_err("failed to initialize %s: device_create(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto device_create_failed;
+		goto err_device_created;
 	}
 
 	pr_info("%s initialized successfully\n", ILOG_DRIVER_NAME);
 	return 0;
 
-device_create_failed:
+err_device_created:
 	class_destroy(cls);
-class_create_failed:
+err_class_created:
 	cdev_del(&interval_logger);
-cdev_add_failed:
+err_cdev_addd:
 	unregister_chrdev_region(devt, 1);
-alloc_chrdev_region_failed:
+err_alloc_chrdev_regiond:
 	return ret;
 }
 
