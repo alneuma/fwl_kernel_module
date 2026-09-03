@@ -1,12 +1,17 @@
 /*
  * interval_logger
  *
- * A character device.
+ * A character device
  *
- * When written to starts periodically logging the first set number of bytes of
- * the write. Consequent writes change what is logged.
+ * write()
+ * Causes periodic logging of the first set number of bytes written.
+ * When the device is already logging, writes only change the message, but do
+ * not reset the logging interval.
+ * Writes of 0 have no effect
  *
- * A reading cancels the logging and returns EOF.
+ * read()
+ * Reads of any size cause the logging to stop.
+ * read() always returns EOF.
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -24,13 +29,26 @@
 #define LOG_INTERVAL HZ
 #define MSG_BUFSIZE 8
 
-static DEFINE_MUTEX(ilog_mutex);
+/*
+ * Locks:
+ *
+ * ilog_control:
+ * ascertains atomicity for starting and stopping logging
+ *
+ * ilog_data:
+ * protects concurrently read and written data
+ *
+ * lock ordering:
+ * 1. ilog_control
+ * 2. ilog_data
+ */
+static DEFINE_MUTEX(ilog_control);
+static DEFINE_MUTEX(ilog_data);
 static dev_t devt;
 static struct cdev interval_logger;
 static struct class *cls;
 static struct delayed_work work;
 static unsigned long next_log;
-static bool logging = false;
 static char message_buf[MSG_BUFSIZE];
 static size_t message_size = 0;
 
@@ -44,22 +62,24 @@ static size_t message_size = 0;
  * set to 0.
  *
  * note:
- * time_before() uses signed arithmetic to determine the result for
- * wraparound cases. The half-range rule holds.
+ * time_before() uses signed arithmetic for wraparound safety. This works within
+ * the limitations of the half-range rule.
  */
 static void ilog_work_handler(struct work_struct *work)
 {
 	struct delayed_work *dwork;
 	unsigned long delay;
 
-	mutex_lock(&ilog_mutex);
+	mutex_lock(&ilog_data);
 
-	if (!logging) {
-		mutex_unlock(&ilog_mutex);
+	if (!message_size) {
+		mutex_unlock(&ilog_data);
 		return;
 	}
 
 	pr_info("%*phC\n", (int)message_size, message_buf);
+
+	mutex_unlock(&ilog_data);
 
 	dwork = to_delayed_work(work);
 
@@ -71,23 +91,19 @@ static void ilog_work_handler(struct work_struct *work)
 
 	schedule_delayed_work(dwork, delay);
 
-	mutex_unlock(&ilog_mutex);
 }
 
 /*
- * ilog_start_log_lock()
- *
- * must be mutex protected
+ * ilog_start_log()
  */
-static void ilog_start_log_lock(void)
+static void ilog_start_log(void)
 {
 	if (schedule_delayed_work(&work, LOG_INTERVAL)) {
 		next_log = jiffies + LOG_INTERVAL;
-		pr_info("scheduled work item\n");
+		pr_debug("scheduled work item\n");
 	}
 	else
-		pr_info("work item already pending\n");
-	logging = true;
+		pr_debug("work item already pending\n");
 }
 
 /*
@@ -111,16 +127,12 @@ static int ilog_release(struct inode *inode, struct file *filp)
 /*
  * ilog_write()
  *
- * ilog_start_log() needs to be protected to avoid this:
+ * write of 0 has no effect.
  *
- * Thread A in ilog_read()
- * Thread B in ilog_write()
+ * Otherwise:
  *
- * A: cancel_delayed_work_sync()
- * B: ilog_start_log()
- * A: message_size = 0;
- *
- * which would cause the logging of empty messages
+ * If logging is active, this merely changes the message.
+ * If no logging is active this sets the message and starts it.
  */
 static ssize_t ilog_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
@@ -133,22 +145,33 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 	if (!copy_size)
 		return 0;
 
-	if (copy_from_user(tmp_buf, buf, copy_size)) {
-		mutex_unlock(&ilog_mutex);
+	if (copy_from_user(tmp_buf, buf, copy_size))
 		return -EFAULT;
-	}
 
-	mutex_lock(&ilog_mutex);
+	mutex_lock(&ilog_control);
+	mutex_lock(&ilog_data);
+
 	memcpy(message_buf, tmp_buf, copy_size);
 	message_size = copy_size;
-	ilog_start_log_lock();
-	mutex_unlock(&ilog_mutex);
+
+	ilog_start_log();
+
+	mutex_unlock(&ilog_data);
+	mutex_unlock(&ilog_control);
 
 	return copy_size;
 }
 
 /*
  * ilog_read()
+ *
+ * Stops logging, returns EOF
+ *
+ * cancel_delayed_work_sync() can not be protected by the same mutex that
+ * is used by the work itself. Otherwise the is a deadlock scenario,
+ * when cancel_delayed_work_sync() has acqured the lock before work:
+ * work could be waiting for the lock while cancel_delayed_work_sync() is
+ * waiting for work to finish.
  */
 static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
@@ -156,10 +179,14 @@ static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
 
 	pr_debug("called\n");
 
-	mutex_lock(&ilog_mutex);
-	logging = false;
+	mutex_lock(&ilog_control);
+
+	mutex_lock(&ilog_data);
 	message_size = 0;
-	mutex_unlock(&ilog_mutex);
+	mutex_unlock(&ilog_data);
+
+	(void)cancel_delayed_work_sync(&work);
+	mutex_unlock(&ilog_control);
 
 	return 0;
 }
@@ -185,7 +212,7 @@ static int __init ilog_init(void)
 	if (ret) {
 		pr_err("failed to initialize %s: alloc_chrdev_region(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto err_alloc_chrdev_regiond;
+		goto err_alloc_chrdev_region;
 	}
 
 	cdev_init(&interval_logger, &ilog_ops);
@@ -193,7 +220,7 @@ static int __init ilog_init(void)
 	if (ret) {
 		pr_err("failed to initialize %s: cdev_add(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto err_cdev_addd;
+		goto err_cdev_add;
 	}
 
 	cls = class_create(ILOG_DRIVER_NAME);
@@ -201,7 +228,7 @@ static int __init ilog_init(void)
 		ret = PTR_ERR(cls);
 		pr_err("failed to initialize %s: class_create(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto err_class_created;
+		goto err_class_create;
 	}
 
 	dev_ptr = device_create(cls, NULL, devt, NULL, ILOG_DRIVER_NAME);
@@ -209,31 +236,40 @@ static int __init ilog_init(void)
 		ret = PTR_ERR(dev_ptr);
 		pr_err("failed to initialize %s: device_create(): %d\n",
 		       ILOG_DRIVER_NAME, ret);
-		goto err_device_created;
+		goto err_device_create;
 	}
 
 	pr_info("%s initialized successfully\n", ILOG_DRIVER_NAME);
 	return 0;
 
-err_device_created:
+err_device_create:
 	class_destroy(cls);
-err_class_created:
+err_class_create:
 	cdev_del(&interval_logger);
-err_cdev_addd:
+err_cdev_add:
 	unregister_chrdev_region(devt, 1);
-err_alloc_chrdev_regiond:
+err_alloc_chrdev_region:
 	return ret;
 }
 
+/*
+ * setting message_size = 0 potentially prevents an already running work item
+ * from logging. This will hardly ever make an observable difference.
+ */
 static void __exit ilog_exit(void)
 {
 	pr_info("cleaning up %s ...\n", ILOG_DRIVER_NAME);
+
+	mutex_lock(&ilog_data);
+	message_size = 0;
+	mutex_unlock(&ilog_data);
+
+	(void)cancel_delayed_work_sync(&work);
 
 	device_destroy(cls, devt);
 	class_destroy(cls);
 	cdev_del(&interval_logger);
 	unregister_chrdev_region(devt, 1);
-	(void)cancel_delayed_work_sync(&work);
 
 	pr_info("%s removed successfully\n", ILOG_DRIVER_NAME);
 }
