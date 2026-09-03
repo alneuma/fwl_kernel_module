@@ -1,38 +1,52 @@
 /*
- * This toy kernel module implements a character device that enqueues all words
- * written to it in a list.
+ * word_lister
  *
- * A word is considered to be any number of consecutive bytes
- * such that for each byte b holds: !isspace(b) or b == 0x0 or WORD_SEP
+ * A character device
  *
- * f_pos is unused for read() and write().
+ * write()
+ * Splits content of buffer by WORD_SEP, the zero byte or any byte for which
+ * isspace() returns true. The split segments (words) are saved to an internal
+ * list.
+ * Word integrity between different calls to write issued through the same
+ * open file description is preserved. So if we assume two writes of size 4
  *
- * When read from it, the device does not preserve the characters of the
- * original word boundaries. Instead all the words are separated by a single
- * WORD_SEP byte when read.
+ * "Hell" and "o Yo"
+ *
+ * before the ofd is released. Then
+ *
+ * "Hello" -- "Yo"
  * 
- * Word boundaries are preserved between different calls to write().
- * Different open file descriptions have independent word boundaries.
- * Only per open file description completed words are added to the list.
- * 
- * On release() the last uncompleted word is considered to be completed.
- * 
- * Currently word size as well as list size are unbounded.
- * To prevent resource drain this will be changed in future iterations.
- * 
- * Currently also arbitrarily large read and write buffers are allowed.
- * This will be changed or appropriately handled in future iterations.
+ * will be appended to the list, not
  *
- * Design consideration:
- * Should read on empty list return EOF or do something else?
- * atm it return EOF
- * consider blocking/-EAGAIN for blocking/non-blocking reads
+ * "Hell" -- "o" -- "Yo"
  *
- * mutex lock order:
+ * This is achieved by saving per ofd state of unfinished words.
+ * When an ofd is released a potential unfinished word is commited to the list.
  *
- * 1. ofd local data lock
+ * read()
+ * Writes the content of the list's nodes separated by WORD_SEP into the buffer.
+ * The read position is saved as per ofd state in the lcd_cursor struct.
+ * When there are currently no more words to read, then EOF gets returned.
+ *
+ * Caveats:
+ *
+ * - Once a word is commited to the list, it will stay there forever.
+ * - word length, list length, and memory occupied are unbound
+ * - read() and write() buffers are dynamically allocated in the size of the
+ *   buffers passed from userspace.
+ * - no partial reads or writes are possible only success or failure
+ *
+ * Locks:
+ *
+ * lcd_mutex
+ * protects module wide shared state
+ *
+ * ofd local lock
+ * protects ofd local state from concurrent reads/writes
+ *
+ * lock ordering
+ * 1. ofd local lock
  * 2. lcd_mutex
- *
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -93,8 +107,7 @@ static void lcd_pos_update(struct lcd_cursor *pos)
  * - word_list not empty
  * - pos->ptr != NULL && !(pos->ptr == &word_list)
  */
-static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf,
-				size_t count)
+static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf, size_t count)
 {
 	struct lcd_word *e;
 	size_t copy_size;
@@ -102,7 +115,7 @@ static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf,
 
 	e = list_entry(pos->ptr, struct lcd_word, node);
 
-	/* write first word */
+	/* copy first word */
 	if (pos->word_pos < e->len) {
 		copy_size = min(e->len - pos->word_pos, count);
 		memcpy(buf, e->word + pos->word_pos, copy_size);
@@ -112,7 +125,7 @@ static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf,
 	if (idx == count)
 		return idx;
 
-	/* write separator */
+	/* copy separator */
 	if (!list_is_last(pos->ptr, &word_list)) {
 		buf[idx++] = WORD_SEP;
 		pos->word_pos = 0;
@@ -120,7 +133,7 @@ static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf,
 	} else
 		return idx;
 
-	/* write remaining */
+	/* copy remaining */
 	while (idx < count) {
 		e = list_entry(pos->ptr, struct lcd_word, node);
 		copy_size = min(e->len, count - idx);
@@ -141,69 +154,19 @@ static size_t lcd_read_from_pos(struct lcd_cursor *pos, char *buf,
 }
 
 /*
- * lcd_read()
- *
- * Returns words joined with the single byte WORD_SEP.
- */
-static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
-			loff_t *f_pos) {
-
-	(void)f_pos;
-
-	struct lcd_cursor pos;
-	char *tmp_buf;
-	int ret = 0;
-	size_t total_read;
-	struct lcd_file *ofd_data = filp->private_data;
-
-	pr_debug("called\n");
-
-	if (!count)
-		return 0;
-
-	tmp_buf = kmalloc(count, GFP_KERNEL);
-	if (!tmp_buf)
-		return -ENOMEM;
-
-	mutex_lock(&ofd_data->lock);
-
-	pos = ofd_data->pos;
-
-	mutex_lock(&lcd_mutex);
-
-	if (list_empty(&word_list)) {
-		mutex_unlock(&lcd_mutex);
-		mutex_unlock(&ofd_data->lock);
-		return 0;
-	}
-
-	lcd_pos_update(&pos);
-	total_read = lcd_read_from_pos(&pos, tmp_buf, count);
-
-	mutex_unlock(&lcd_mutex);
-
-	if (copy_to_user(buf, tmp_buf, total_read))
-		ret = -EFAULT;
-	else
-		ofd_data->pos = pos;
-
-	mutex_unlock(&ofd_data->lock);
-
-	kfree(tmp_buf);
-	return ret ? ret : total_read;
-}
-
-/*
  * lcd_word_delim()
  *
- * In case WORD_SEP is not within the set defined by isspace(),
- * c == WORD_SEP is separately checked.
+ * c == WORD_SEP is separately checked, in case WORD_SEP is not within the set
+ * defined by isspace().
  */
 static int lcd_word_delim(char c)
 {
 	return isspace((unsigned char)c) || c == 0x0 || c == WORD_SEP;
 }
 
+/*
+ * lcd_word_list_clear()
+ */
 static void lcd_word_list_clear(struct list_head *list)
 {
 	struct lcd_word *e;
@@ -262,12 +225,14 @@ static int lcd_word_make(struct lcd_word **new_word, const char *prefix,
 /*
  * lcd_enlist_words()
  * 
- * If successful words in buf will be appended to list. The struct lcd_word
- * saved in filp->private_data will be considered to be the start of the buffer.
- * if there is an unfinished word at the end of the buffer it will be saved
- * in the struct lcd_word in filp->private_data.
+ * Uses per ofd saved unfinished words from ofd_data->stash and the input buffer
+ * to construct a list of words.
  *
- * On failure filp and list will stay unmodified.
+ * On failure the whole list will be cleared and ofd_data->stash will stay
+ * unmodified.
+ *
+ * On success ofd_data->stash will be either set to NULL or filled with a new
+ * unfinished word.
  */
 static int lcd_enlist_words(struct list_head *list, struct file *filp,
 			    const char *buf, size_t buf_size)
@@ -296,7 +261,6 @@ static int lcd_enlist_words(struct list_head *list, struct file *filp,
 	}
 
 	while (idx < buf_size) {
-
 		new_word = NULL;
 		while (idx < buf_size && lcd_word_delim(buf[idx]))
 			++idx;
@@ -324,6 +288,47 @@ success:
 failure:
 	lcd_word_list_clear(list);
 	return ret;
+}
+
+/*
+ * lcd_open()
+ * initialized per ofd data
+ */
+static int lcd_open(struct inode *inode, struct file *filp)
+{
+	pr_debug("called\n");
+
+	struct lcd_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
+	if (!ofd_data)
+		return -ENOMEM;
+
+	mutex_init(&ofd_data->lock);
+	filp->private_data = ofd_data;
+
+	return 0;
+}
+
+/*
+ * lcd_release()
+ * cleans up and commits any unfinished words from per ofd_data->stash to list
+ */
+static int lcd_release(struct inode *inode, struct file *filp)
+{
+	pr_debug("called\n");
+
+	struct lcd_file *ofd_data = filp->private_data;
+	struct lcd_word *stash = ofd_data->stash;
+	ofd_data->stash = NULL;
+
+	if (stash) {
+		mutex_lock(&lcd_mutex);
+		list_add_tail(&stash->node, &word_list);
+		mutex_unlock(&lcd_mutex);
+	}
+
+	kfree(filp->private_data);
+
+	return 0;
 }
 
 /*
@@ -392,39 +397,57 @@ static ssize_t lcd_write(struct file *filp, const char __user *buf,
 	return count;
 }
 
-static int lcd_open(struct inode *inode, struct file *filp)
+/*
+ * lcd_read()
+ *
+ * Returns words joined with the single byte WORD_SEP.
+ */
+static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
+			loff_t *f_pos)
 {
+	(void)f_pos;
+
+	struct lcd_cursor pos;
+	char *tmp_buf;
+	int ret = 0;
+	size_t total_read;
+	struct lcd_file *ofd_data = filp->private_data;
+
 	pr_debug("called\n");
 
-	/* sets file->data->word = NULL */
-	struct lcd_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
-	if (!ofd_data)
+	if (!count)
+		return 0;
+
+	tmp_buf = kmalloc(count, GFP_KERNEL);
+	if (!tmp_buf)
 		return -ENOMEM;
 
-	mutex_init(&ofd_data->lock);
-	filp->private_data = ofd_data;
+	mutex_lock(&ofd_data->lock);
 
-	return 0;
-}
+	pos = ofd_data->pos;
 
-/* adds unfinished per open words to list */
-static int lcd_release(struct inode *inode, struct file *filp)
-{
-	pr_debug("called\n");
+	mutex_lock(&lcd_mutex);
 
-	struct lcd_file *ofd_data = filp->private_data;
-	struct lcd_word *stash = ofd_data->stash;
-	ofd_data->stash = NULL;
-
-	if (stash) {
-		mutex_lock(&lcd_mutex);
-		list_add_tail(&stash->node, &word_list);
+	if (list_empty(&word_list)) {
 		mutex_unlock(&lcd_mutex);
+		mutex_unlock(&ofd_data->lock);
+		return 0;
 	}
 
-	kfree(filp->private_data);
+	lcd_pos_update(&pos);
+	total_read = lcd_read_from_pos(&pos, tmp_buf, count);
 
-	return 0;
+	mutex_unlock(&lcd_mutex);
+
+	if (copy_to_user(buf, tmp_buf, total_read))
+		ret = -EFAULT;
+	else
+		ofd_data->pos = pos;
+
+	mutex_unlock(&ofd_data->lock);
+
+	kfree(tmp_buf);
+	return ret ? ret : total_read;
 }
 
 static const struct file_operations lcd_ops = {
