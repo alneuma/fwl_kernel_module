@@ -26,7 +26,9 @@
  * read()
  * Writes the content of the list's nodes separated by WORD_SEP into the buffer.
  * The read position is saved as per ofd state in the lcd_cursor struct.
- * When there are currently no more words to read, then EOF gets returned.
+ * When there are currently no more words to read, then EOF gets returned. But
+ * more words could be commited later.
+ * We might want to implement polling here.
  *
  * Caveats:
  *
@@ -34,7 +36,9 @@
  * - word length, list length, and memory occupied are unbound
  * - read() and write() buffers are dynamically allocated in the size of the
  *   buffers passed from userspace.
- * - no partial reads or writes are possible only success or failure
+ * - no partial reads or writes are properly dealt with. Still partial reads
+ *   can happen. The user must know, that in such cases the read cursor is not
+ *   advanced.
  *
  * Locks:
  *
@@ -431,6 +435,7 @@ static ssize_t lcd_read(struct file *filp, char __user *buf, size_t count,
 	if (list_empty(&word_list)) {
 		mutex_unlock(&lcd_mutex);
 		mutex_unlock(&ofd_data->lock);
+		kfree(tmp_buf);
 		return 0;
 	}
 
