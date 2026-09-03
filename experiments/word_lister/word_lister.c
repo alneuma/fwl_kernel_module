@@ -1,0 +1,539 @@
+/*
+ * word_lister
+ *
+ * A character device that reads words and saves them into a list.
+ *
+ * Interface:
+ *
+ * write()
+ * Splits content of buffer by WLST_WORD_SEP, the zero byte or any byte for
+ * which isspace() returns true. The split segments (words) are saved to an
+ * internal list.
+ * Word integrity between different calls to write issued through the same
+ * open file description is preserved. So if we assume two writes of size 4
+ *
+ * "Hell" and "o Yo"
+ *
+ * before the ofd is released. Then
+ *
+ * "Hello" -- "Yo"
+ * 
+ * will be appended to the list, not
+ *
+ * "Hell" -- "o" -- "Yo"
+ *
+ * This is achieved by saving per ofd state of unfinished words.
+ * When an ofd is released a potential unfinished word is commited to the list.
+ *
+ * read()
+ * Writes the content of the list's nodes separated by WLST_WORD_SEP into the
+ * buffer.
+ * The read position is saved as per ofd state in the wlst_cursor struct.
+ * When there are currently no more words to read, then EOF gets returned. But
+ * more words could be commited later.
+ * We might want to implement polling here.
+ *
+ * Caveats:
+ *
+ * - Once a word is commited to the list, it will stay there forever.
+ * - word length, list length, and memory occupied are unbound
+ * - read() and write() buffers are dynamically allocated in the size of the
+ *   buffers passed from userspace.
+ * - no partial reads or writes are properly dealt with. Still partial reads
+ *   can happen. The user must know, that in such cases the read cursor is not
+ *   advanced.
+ *
+ * Locks:
+ *
+ * wlst_mutex
+ * protects module wide shared state
+ *
+ * ofd local lock
+ * protects ofd local state from concurrent reads/writes
+ *
+ * lock ordering
+ * 1. ofd local lock
+ * 2. wlst_mutex
+ */
+#define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/printk.h>
+#include <linux/init.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/slab.h>
+#include <linux/list.h>
+#include <linux/ctype.h>
+#include <linux/mutex.h>
+#include <linux/errno.h>
+#include <linux/overflow.h>
+#include <linux/types.h>
+
+#define WLST_DRIVER_NAME "word_lister"
+#define WLST_WORD_SEP ' '
+
+struct wlst_word {
+	struct list_head node;
+	size_t len;
+	char word[];
+};
+
+struct wlst_cursor {
+	struct list_head *ptr;
+	size_t word_pos;
+};
+
+struct wlst_file {
+	struct wlst_cursor pos;
+	struct mutex lock;
+	struct wlst_word *stash;
+};
+
+static DEFINE_MUTEX(wlst_mutex);
+static dev_t devt;
+static struct cdev word_lister;
+static struct class *cls;
+static LIST_HEAD(word_list);
+
+static void wlst_pos_update(struct wlst_cursor *pos)
+{
+	if (!pos->ptr) {
+		pos->ptr = word_list.next;
+		pos->word_pos = 0;
+	}
+	return;
+}
+
+/*
+ * wlst_read_from_pos()
+ *
+ * assumptions:
+ * - wlst_mutex held
+ * - word_list not empty
+ * - pos->ptr != NULL && !(pos->ptr == &word_list)
+ */
+static size_t wlst_read_from_pos(struct wlst_cursor *pos, char *buf,
+				 size_t count)
+{
+	struct wlst_word *e;
+	size_t copy_size;
+	size_t idx = 0;
+
+	e = list_entry(pos->ptr, struct wlst_word, node);
+
+	/* copy first word */
+	if (pos->word_pos < e->len) {
+		copy_size = min(e->len - pos->word_pos, count);
+		memcpy(buf, e->word + pos->word_pos, copy_size);
+		idx += copy_size;
+		pos->word_pos += copy_size;
+	}
+	if (idx == count)
+		return idx;
+
+	/* copy separator */
+	if (!list_is_last(pos->ptr, &word_list)) {
+		buf[idx++] = WLST_WORD_SEP;
+		pos->word_pos = 0;
+		pos->ptr = pos->ptr->next;
+	} else
+		return idx;
+
+	/* copy remaining */
+	while (idx < count) {
+		e = list_entry(pos->ptr, struct wlst_word, node);
+		copy_size = min(e->len, count - idx);
+		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
+		idx += copy_size;
+		pos->word_pos = copy_size;
+		if (idx == count)
+			return idx;
+		if (!list_is_last(pos->ptr, &word_list)) {
+			buf[idx++] = WLST_WORD_SEP;
+			pos->word_pos = 0;
+			pos->ptr = pos->ptr->next;
+		} else
+			return idx;
+	}
+
+	return idx;
+}
+
+/*
+ * wlst_word_delim()
+ *
+ * c == WLST_WORD_SEP is separately checked, in case WLST_WORD_SEP is not
+ * within the set defined by isspace().
+ */
+static int wlst_word_delim(char c)
+{
+	return isspace((unsigned char)c) || c == 0x0 || c == WLST_WORD_SEP;
+}
+
+/*
+ * wlst_word_list_clear()
+ */
+static void wlst_word_list_clear(struct list_head *list)
+{
+	struct wlst_word *e;
+	struct wlst_word *n;
+
+	list_for_each_entry_safe(e, n, list, node) {
+		list_del(&e->node);
+		kfree(e);
+	}
+}
+
+/*
+ * wlst_word_make()
+ * composes a new word from prefix and suffix
+ *
+ * return values:
+ * success -> 0
+ * failure -> error < 0
+ *
+ * checked runtime errors:
+ * prefix_len + suffix_len == 0 -> -EINVAL
+ * 
+ * unchecked runtime errors:
+ * prefix == NULL && prefix_len > 0
+ * suffix == NULL && suffix_len > 0
+ */
+static int wlst_word_make(struct wlst_word **new_word, const char *prefix,
+			  size_t prefix_len, const char *suffix,
+			  size_t suffix_len)
+{
+	pr_debug("called\n");
+
+	size_t len;
+	if (check_add_overflow(prefix_len, suffix_len, &len))
+		return -EOVERFLOW;
+
+	if (!len)
+		return -EINVAL;
+
+	const size_t size = struct_size(*new_word, word, len);
+	if (size == SIZE_MAX)
+		return -EOVERFLOW;
+
+	*new_word = kmalloc(size, GFP_KERNEL);
+	if (!*new_word)
+		return -ENOMEM;
+
+	memcpy((*new_word)->word, prefix, prefix_len);
+	memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
+
+	(*new_word)->len = len;
+
+	return 0;
+}
+
+/*
+ * wlst_enlist_words()
+ * 
+ * Uses per ofd saved unfinished words from ofd_data->stash and the input buffer
+ * to construct a list of words.
+ *
+ * On failure the whole list will be cleared and ofd_data->stash will stay
+ * unmodified.
+ *
+ * On success ofd_data->stash will be either set to NULL or filled with a new
+ * unfinished word.
+ */
+static int wlst_enlist_words(struct list_head *list, struct file *filp,
+			     const char *buf, size_t buf_size)
+{
+	pr_debug("called\n");
+
+	int ret = 0;
+	size_t idx = 0;
+	size_t wstart = 0;
+	struct wlst_file *ofd_data = filp->private_data;
+	struct wlst_word *new_word = NULL;
+
+	if (ofd_data->stash) {
+		while (idx < buf_size && !wlst_word_delim(buf[idx]))
+			++idx;
+
+		ret = wlst_word_make(&new_word, ofd_data->stash->word,
+				     ofd_data->stash->len, buf, idx);
+		if (ret)
+			goto failure;
+
+		if (idx == buf_size)
+			goto success;
+
+		list_add_tail(&new_word->node, list);
+	}
+
+	while (idx < buf_size) {
+		new_word = NULL;
+		while (idx < buf_size && wlst_word_delim(buf[idx]))
+			++idx;
+		if (idx == buf_size)
+			goto success;
+
+		wstart = idx;
+		while (idx < buf_size && !wlst_word_delim(buf[idx]))
+			++idx;
+
+		ret = wlst_word_make(&new_word, buf + wstart, idx - wstart,
+				     NULL, 0);
+		if (ret)
+			goto failure;
+		if (idx == buf_size)
+			goto success;
+
+		list_add_tail(&new_word->node, list);
+	}
+
+success:
+	kfree(ofd_data->stash);
+	ofd_data->stash = new_word;
+	return 0;
+failure:
+	wlst_word_list_clear(list);
+	return ret;
+}
+
+/*
+ * wlst_open()
+ * initialized per ofd data
+ */
+static int wlst_open(struct inode *inode, struct file *filp)
+{
+	pr_debug("called\n");
+
+	struct wlst_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
+	if (!ofd_data)
+		return -ENOMEM;
+
+	mutex_init(&ofd_data->lock);
+	filp->private_data = ofd_data;
+
+	return 0;
+}
+
+/*
+ * wlst_release()
+ * cleans up and commits any unfinished words from per ofd_data->stash to list
+ */
+static int wlst_release(struct inode *inode, struct file *filp)
+{
+	pr_debug("called\n");
+
+	struct wlst_file *ofd_data = filp->private_data;
+	struct wlst_word *stash = ofd_data->stash;
+	ofd_data->stash = NULL;
+
+	if (stash) {
+		mutex_lock(&wlst_mutex);
+		list_add_tail(&stash->node, &word_list);
+		mutex_unlock(&wlst_mutex);
+	}
+
+	kfree(filp->private_data);
+
+	return 0;
+}
+
+/*
+ * wlst_write()
+ *
+ * To prevent an edgecases that would introduce unintuitive word ordering,
+ * ofd_data->lock is only released after the new list segment is commited to the
+ * shared list.
+ *
+ * Consider this:
+ *
+ * Thread A and thread B share one open file description:
+ *
+ * A: writes "Hello W"
+ * B: writes "orld "
+ * A: calls close()
+ * B: calls close()
+ *
+ * If A executes wlst_enlist_words() before B but list_splice_tail_init() after
+ * B, the list
+ *
+ * "World" -- "Hello"
+ *
+ * will be appended to the shared list, which is inconsitent with the order of
+ * bytes in A's write.
+ *
+ * With the mutex protection one of the following will be appended:
+ *
+ * 1. "Hello" -- "World"
+ * 2. "orld" -- "Hello" -- "W"
+ *
+ * Both 1. and 2. are consistent with the byte ordering of individual writes.
+ */
+static ssize_t wlst_write(struct file *filp, const char __user *buf,
+			  size_t count, loff_t *f_pos)
+{
+	(void)f_pos;
+
+	pr_debug("called\n");
+
+	LIST_HEAD(tmp_list);
+	int ret;
+	struct wlst_file *ofd_data = filp->private_data;
+
+	if (!count)
+		return 0;
+
+	char *devbuf = memdup_user(buf, count);
+	if (IS_ERR(devbuf))
+		return PTR_ERR(devbuf);
+
+	mutex_lock(&ofd_data->lock);
+
+	ret = wlst_enlist_words(&tmp_list, filp, devbuf, count);
+	kfree(devbuf);
+	if (ret)
+		return ret;
+
+	mutex_lock(&wlst_mutex);
+
+	list_splice_tail_init(&tmp_list, &word_list);
+
+	mutex_unlock(&wlst_mutex);
+	mutex_unlock(&ofd_data->lock);
+
+	return count;
+}
+
+/*
+ * wlst_read()
+ *
+ * Returns words joined with the single byte WLST_WORD_SEP.
+ */
+static ssize_t wlst_read(struct file *filp, char __user *buf, size_t count,
+			 loff_t *f_pos)
+{
+	(void)f_pos;
+
+	struct wlst_cursor pos;
+	char *tmp_buf;
+	int ret = 0;
+	size_t total_read;
+	struct wlst_file *ofd_data = filp->private_data;
+
+	pr_debug("called\n");
+
+	if (!count)
+		return 0;
+
+	tmp_buf = kmalloc(count, GFP_KERNEL);
+	if (!tmp_buf)
+		return -ENOMEM;
+
+	mutex_lock(&ofd_data->lock);
+
+	pos = ofd_data->pos;
+
+	mutex_lock(&wlst_mutex);
+
+	if (list_empty(&word_list)) {
+		mutex_unlock(&wlst_mutex);
+		mutex_unlock(&ofd_data->lock);
+		kfree(tmp_buf);
+		return 0;
+	}
+
+	wlst_pos_update(&pos);
+	total_read = wlst_read_from_pos(&pos, tmp_buf, count);
+
+	mutex_unlock(&wlst_mutex);
+
+	if (copy_to_user(buf, tmp_buf, total_read))
+		ret = -EFAULT;
+	else
+		ofd_data->pos = pos;
+
+	mutex_unlock(&ofd_data->lock);
+
+	kfree(tmp_buf);
+	return ret ? ret : total_read;
+}
+
+static const struct file_operations wlst_ops = {
+	.owner = THIS_MODULE,
+	.open = wlst_open,
+	.release = wlst_release,
+	.read = wlst_read,
+	.write = wlst_write,
+};
+
+static int __init wlst_init(void)
+{
+	int ret = 0;
+	struct device *dev_ptr;
+
+	pr_info("initializing %s ...\n", WLST_DRIVER_NAME);
+
+	ret = alloc_chrdev_region(&devt, 0, 1, WLST_DRIVER_NAME);
+	if (ret) {
+		pr_err("failed to initialize %s: alloc_chrdev_region(): %d\n",
+		       WLST_DRIVER_NAME, ret);
+		goto err_alloc_chrdev_region;
+	}
+
+	cdev_init(&word_lister, &wlst_ops);
+	ret = cdev_add(&word_lister, devt, 1);
+	if (ret) {
+		pr_err("failed to initialize %s: cdev_add(): %d\n",
+		       WLST_DRIVER_NAME, ret);
+		goto err_cdev_add;
+	}
+
+	cls = class_create(WLST_DRIVER_NAME);
+	if (IS_ERR(cls)) {
+		ret = PTR_ERR(cls);
+		pr_err("failed to initialize %s: class_create(): %d\n",
+		       WLST_DRIVER_NAME, ret);
+		goto err_class_create;
+	}
+
+	dev_ptr = device_create(cls, NULL, devt, NULL, WLST_DRIVER_NAME);
+	if (IS_ERR(dev_ptr)) {
+		ret = PTR_ERR(dev_ptr);
+		pr_err("failed to initialize %s: device_create(): %d\n",
+		       WLST_DRIVER_NAME, ret);
+		goto err_device_create;
+	}
+
+	pr_info("%s initialized successfully\n", WLST_DRIVER_NAME);
+	return 0;
+
+err_device_create:
+	class_destroy(cls);
+err_class_create:
+	cdev_del(&word_lister);
+err_cdev_add:
+	unregister_chrdev_region(devt, 1);
+err_alloc_chrdev_region:
+	return ret;
+}
+
+static void __exit wlst_exit(void)
+{
+	pr_info("cleaning up %s ...\n", WLST_DRIVER_NAME);
+
+	device_destroy(cls, devt);
+	class_destroy(cls);
+	cdev_del(&word_lister);
+	unregister_chrdev_region(devt, 1);
+	wlst_word_list_clear(&word_list);
+
+	pr_info("%s removed successfully\n", WLST_DRIVER_NAME);
+}
+
+module_init(wlst_init);
+module_exit(wlst_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("alneuma");
+MODULE_DESCRIPTION("character device experiment using a list");
