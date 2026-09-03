@@ -20,6 +20,7 @@
 
 #define ILOG_DRIVER_NAME "interval_logger"
 #define LOG_INTERVAL HZ
+#define MSG_BUFSIZE 8
 
 static DEFINE_MUTEX(ilog_mutex);
 static dev_t devt;
@@ -28,7 +29,8 @@ static struct class *cls;
 static struct delayed_work work;
 static unsigned long next_log;
 
-static char *message = "Wazzup?";
+char message_buf[MSG_BUFSIZE];
+size_t message_size = 0;
 
 /* 
  * ilog_work_handler()
@@ -44,7 +46,9 @@ static void ilog_work_handler(struct work_struct *work)
 	struct delayed_work *dwork;
 	unsigned long delay;
 
-	pr_info("%s\n", message);
+	mutex_lock(&ilog_mutex);
+	pr_info("%.*s\n", (int)message_size, message_buf);
+	mutex_unlock(&ilog_mutex);
 
 	dwork = to_delayed_work(work);
 	next_log += LOG_INTERVAL;
@@ -86,20 +90,49 @@ static int ilog_release(struct inode *inode, struct file *filp)
 static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
 {
+
 	pr_debug("called\n");
+
+	mutex_lock(&ilog_mutex);
 	(void)cancel_delayed_work_sync(&work);
+	message_size = 0;
+	mutex_unlock(&ilog_mutex);
+
 	return 0;
 }
 
 /*
  * ilog_write()
+ *
+ * ilog_start_log() needs to be protected to avoid this:
+ *
+ * Thread A in ilog_read()
+ * Thread B in ilog_write()
+ *
+ * A: cancel_delayed_work_sync()
+ * B: ilog_start_log()
+ * A: message_size = 0;
+ *
+ * which would cause the logging of empty messages
  */
 static ssize_t ilog_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
+	size_t copy_size = min(count, MSG_BUFSIZE);
+
 	pr_debug("called\n");
+
+	mutex_lock(&ilog_mutex);
+	if (copy_from_user(message_buf, buf, copy_size)) {
+		mutex_unlock(&ilog_mutex);
+		return -EFAULT;
+	}
+	message_size = copy_size;
 	ilog_start_log();
-	return count;
+
+	mutex_unlock(&ilog_mutex);
+
+	return copy_size;
 }
 
 static const struct file_operations ilog_ops = {
