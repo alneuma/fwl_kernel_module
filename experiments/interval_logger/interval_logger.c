@@ -26,14 +26,14 @@
 #include <linux/workqueue.h>
 
 #define ILOG_DRIVER_NAME "interval_logger"
-#define LOG_INTERVAL HZ
-#define MSG_BUFSIZE 8
+#define ILOG_LOG_INTERVAL HZ
+#define ILOG_MSG_BUFSIZE 8
 
 /*
  * Locks:
  *
  * ilog_control:
- * ascertains atomicity for starting and stopping logging
+ * ascertains atomicity for operations controling the logging
  *
  * ilog_data:
  * protects concurrently read and written data
@@ -47,9 +47,9 @@ static DEFINE_MUTEX(ilog_data);
 static dev_t devt;
 static struct cdev interval_logger;
 static struct class *cls;
-static struct delayed_work work;
+static struct delayed_work ilog_work;
 static unsigned long next_log;
-static char message_buf[MSG_BUFSIZE];
+static char message_buf[ILOG_MSG_BUFSIZE];
 static size_t message_size = 0;
 
 /* 
@@ -83,26 +83,24 @@ static void ilog_work_handler(struct work_struct *work)
 
 	dwork = to_delayed_work(work);
 
-	next_log += LOG_INTERVAL;
+	next_log += ILOG_LOG_INTERVAL;
 	if (time_before(next_log, jiffies))
 		delay = 0;
 	else
 		delay = next_log - jiffies;
 
 	schedule_delayed_work(dwork, delay);
-
 }
 
 /*
- * ilog_start_log()
+ * ilog_schedule_work()
  */
-static void ilog_start_log(void)
+static void ilog_schedule_work(void)
 {
-	if (schedule_delayed_work(&work, LOG_INTERVAL)) {
-		next_log = jiffies + LOG_INTERVAL;
+	if (schedule_delayed_work(&ilog_work, ILOG_LOG_INTERVAL)) {
+		next_log = jiffies + ILOG_LOG_INTERVAL;
 		pr_debug("scheduled work item\n");
-	}
-	else
+	} else
 		pr_debug("work item already pending\n");
 }
 
@@ -135,10 +133,10 @@ static int ilog_release(struct inode *inode, struct file *filp)
  * If no logging is active this sets the message and starts it.
  */
 static ssize_t ilog_write(struct file *filp, const char __user *buf,
-			 size_t count, loff_t *f_pos)
+			  size_t count, loff_t *f_pos)
 {
-	size_t copy_size = min(count, MSG_BUFSIZE);
-	char tmp_buf[MSG_BUFSIZE];
+	size_t copy_size = min(count, ILOG_MSG_BUFSIZE);
+	char tmp_buf[ILOG_MSG_BUFSIZE];
 
 	pr_debug("called\n");
 
@@ -154,7 +152,7 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 	memcpy(message_buf, tmp_buf, copy_size);
 	message_size = copy_size;
 
-	ilog_start_log();
+	ilog_schedule_work();
 
 	mutex_unlock(&ilog_data);
 	mutex_unlock(&ilog_control);
@@ -174,9 +172,8 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
  * waiting for work to finish.
  */
 static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
-			loff_t *f_pos)
+			 loff_t *f_pos)
 {
-
 	pr_debug("called\n");
 
 	mutex_lock(&ilog_control);
@@ -185,7 +182,7 @@ static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
 	message_size = 0;
 	mutex_unlock(&ilog_data);
 
-	(void)cancel_delayed_work_sync(&work);
+	(void)cancel_delayed_work_sync(&ilog_work);
 	mutex_unlock(&ilog_control);
 
 	return 0;
@@ -206,7 +203,7 @@ static int __init ilog_init(void)
 
 	pr_info("initializing %s ...\n", ILOG_DRIVER_NAME);
 
-	INIT_DELAYED_WORK(&work, ilog_work_handler);
+	INIT_DELAYED_WORK(&ilog_work, ilog_work_handler);
 
 	ret = alloc_chrdev_region(&devt, 0, 1, ILOG_DRIVER_NAME);
 	if (ret) {
@@ -264,7 +261,7 @@ static void __exit ilog_exit(void)
 	message_size = 0;
 	mutex_unlock(&ilog_data);
 
-	(void)cancel_delayed_work_sync(&work);
+	(void)cancel_delayed_work_sync(&ilog_work);
 
 	device_destroy(cls, devt);
 	class_destroy(cls);
