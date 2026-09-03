@@ -438,6 +438,7 @@ static const struct file_operations lcd_ops = {
 static int __init lcd_init(void)
 {
 	int ret = 0;
+	struct device *dev_ptr;
 
 	pr_info("initializing %s ...\n", LCD_DRIVER_NAME);
 
@@ -445,7 +446,7 @@ static int __init lcd_init(void)
 	if (ret) {
 		pr_err("failed to initialize %s: alloc_chrdev_region(): %d\n",
 		       LCD_DRIVER_NAME, ret);
-		goto alloc_chrdev_region_failed;
+		goto err_alloc_chrdev_region;
 	}
 
 	cdev_init(&list_chardev, &lcd_ops);
@@ -453,36 +454,35 @@ static int __init lcd_init(void)
 	if (ret) {
 		pr_err("failed to initialize %s: cdev_add(): %d\n",
 		       LCD_DRIVER_NAME, ret);
-		goto cdev_add_failed;
+		goto err_cdev_add;
 	}
 
-	cls = class_create(LCD_DRIVER_NAME); /* assumes kernel >= 6.4.0 */
+	cls = class_create(LCD_DRIVER_NAME);
 	if (IS_ERR(cls)) {
 		ret = PTR_ERR(cls);
 		pr_err("failed to initialize %s: class_create(): %d\n",
 		       LCD_DRIVER_NAME, ret);
-		goto class_create_failed;
+		goto err_class_create;
 	}
 
-	struct device *retp =
-		device_create(cls, NULL, devt, NULL, LCD_DRIVER_NAME);
-	if (IS_ERR(retp)) {
-		ret = PTR_ERR(retp);
+	dev_ptr = device_create(cls, NULL, devt, NULL, LCD_DRIVER_NAME);
+	if (IS_ERR(dev_ptr)) {
+		ret = PTR_ERR(dev_ptr);
 		pr_err("failed to initialize %s: device_create(): %d\n",
 		       LCD_DRIVER_NAME, ret);
-		goto device_create_failed;
+		goto err_device_create;
 	}
 
 	pr_info("%s initialized successfully\n", LCD_DRIVER_NAME);
 	return 0;
 
-device_create_failed:
+err_device_create:
 	class_destroy(cls);
-class_create_failed:
+err_class_create:
 	cdev_del(&list_chardev);
-cdev_add_failed:
+err_cdev_add:
 	unregister_chrdev_region(devt, 1);
-alloc_chrdev_region_failed:
+err_alloc_chrdev_region:
 	return ret;
 }
 
