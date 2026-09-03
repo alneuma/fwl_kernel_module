@@ -1,7 +1,9 @@
 /*
  * word_lister
  *
- * A character device
+ * A character device that reads words and saves them into a list.
+ *
+ * Interface:
  *
  * write()
  * Splits content of buffer by WORD_SEP, the zero byte or any byte for which
