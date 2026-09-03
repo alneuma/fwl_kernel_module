@@ -35,6 +35,7 @@ static struct cdev interval_logger;
 static struct class *cls;
 static struct delayed_work work;
 static unsigned long next_log;
+static bool logging = false;
 
 char message_buf[MSG_BUFSIZE];
 size_t message_size = 0;
@@ -54,15 +55,27 @@ static void ilog_work_handler(struct work_struct *work)
 	unsigned long delay;
 
 	mutex_lock(&ilog_mutex);
+
+	if (!logging) {
+		mutex_unlock(&ilog_mutex);
+		return;
+	}
+
 	pr_info("%.*s\n", (int)message_size, message_buf);
-	mutex_unlock(&ilog_mutex);
 
 	dwork = to_delayed_work(work);
 	next_log += LOG_INTERVAL;
 	delay = next_log - jiffies;
 	schedule_delayed_work(dwork, delay > LOG_INTERVAL ? 0 : delay);
+
+	mutex_unlock(&ilog_mutex);
 }
 
+/*
+ * ilog_start_log()
+ *
+ * must be mutex protected
+ */
 static void ilog_start_log(void)
 {
 	if (schedule_delayed_work(&work, LOG_INTERVAL)) {
@@ -71,6 +84,7 @@ static void ilog_start_log(void)
 	}
 	else
 		pr_info("work item already pending\n");
+	logging = true;
 }
 
 /*
@@ -101,7 +115,7 @@ static ssize_t ilog_read(struct file *filp, char __user *buf, size_t count,
 	pr_debug("called\n");
 
 	mutex_lock(&ilog_mutex);
-	(void)cancel_delayed_work_sync(&work);
+	logging = false;
 	message_size = 0;
 	mutex_unlock(&ilog_mutex);
 
