@@ -1,5 +1,12 @@
 /*
  * interval_logger
+ *
+ * A character device.
+ *
+ * When written to starts periodically logging the first set number of bytes of
+ * the write. Consequent writes change what is logged.
+ *
+ * A reading cancels the logging
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
