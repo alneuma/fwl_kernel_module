@@ -72,11 +72,11 @@ static void ilog_work_handler(struct work_struct *work)
 }
 
 /*
- * ilog_start_log()
+ * ilog_start_log_lock()
  *
  * must be mutex protected
  */
-static void ilog_start_log(void)
+static void ilog_start_log_lock(void)
 {
 	if (schedule_delayed_work(&work, LOG_INTERVAL)) {
 		next_log = jiffies + LOG_INTERVAL;
@@ -152,7 +152,7 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 	mutex_lock(&ilog_mutex);
 	memcpy(message_buf, tmp_buf, copy_size);
 	message_size = copy_size;
-	ilog_start_log();
+	ilog_start_log_lock();
 	mutex_unlock(&ilog_mutex);
 
 	return copy_size;
