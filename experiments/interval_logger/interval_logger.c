@@ -140,17 +140,19 @@ static ssize_t ilog_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
 	size_t copy_size = min(count, MSG_BUFSIZE);
+	char tmp_buf[MSG_BUFSIZE];
 
 	pr_debug("called\n");
 
-	mutex_lock(&ilog_mutex);
-	if (copy_from_user(message_buf, buf, copy_size)) {
+	if (copy_from_user(tmp_buf, buf, copy_size)) {
 		mutex_unlock(&ilog_mutex);
 		return -EFAULT;
 	}
+
+	mutex_lock(&ilog_mutex);
+	memcpy(message_buf, tmp_buf, copy_size);
 	message_size = copy_size;
 	ilog_start_log();
-
 	mutex_unlock(&ilog_mutex);
 
 	return copy_size;
