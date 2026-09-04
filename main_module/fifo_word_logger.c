@@ -136,12 +136,12 @@ static struct delayed_work fwl_work;
  * To counteract time drift the scheduling delay is calculated by subtracting
  * the current time from the ideal execution time of the next work item.
  *
- * If the actual time is already past this ideal execution time, the delay is
- * set to 0.
+ * In the exceptional case in which the current time is already past the ideal
+ * execution time of the next item, the delay is instead set to 0.
  *
  * note:
  * time_before() uses signed arithmetic for wraparound safety. This works within
- * the limitations of the half-range rule.
+ * the limitations of the "half-range rule".
  */
 static void fwl_work_handler(struct work_struct *work)
 {
