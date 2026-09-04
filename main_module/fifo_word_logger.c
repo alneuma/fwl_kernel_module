@@ -142,6 +142,42 @@ static FWL_NODE_IDX next_idx = 1;
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
 
+/*
+ * fwl_consume_word()
+ * Do I need to make certain, that the int cast is safe here?
+ */
+static void fwl_consume_word(struct list_head *words)
+{
+	struct fwl_word *e;
+
+	e = list_first_entry_or_null(words, struct fwl_word, node);
+	if (!e)
+		return;
+
+	pr_info("%.*s\n", (int)e->len, e->word);
+
+	list_del(&e->node);
+	kfree(e);
+}
+
+/*
+ * fwl_schedule_work()
+ */
+static void fwl_schedule_work(struct work_struct *work)
+{
+	unsigned long delay;
+
+	mutex_lock(&schedule_lock);
+	next_log += FWL_LOG_INTERVAL;
+	if (time_before(next_log, jiffies))
+		delay = 0;
+	else
+		delay = next_log - jiffies;
+	mutex_unlock(&schedule_lock);
+
+	(void)schedule_delayed_work(to_delayed_work(work), delay);
+}
+
 /* 
  * fwl_work_handler()
  *
@@ -157,21 +193,10 @@ static void fwl_list_log(const struct list_head *l, const char *label);
  */
 static void fwl_work_handler(struct work_struct *work)
 {
-	struct delayed_work *dwork;
-	struct fwl_word *e;
-	unsigned long delay;
 
 	mutex_lock(&fwl_mutex);
 
-	e = list_first_entry_or_null(&word_list, struct fwl_word, node);
-	if (!e) {
-		mutex_unlock(&fwl_mutex);
-		return;
-	}
-
-	pr_info("%.*s\n", (int)e->len, e->word);
-	list_del(&e->node);
-	kfree(e);
+	fwl_consume_word(&word_list);
 
 	if (list_empty(&word_list)) {
 		mutex_unlock(&fwl_mutex);
@@ -180,17 +205,7 @@ static void fwl_work_handler(struct work_struct *work)
 
 	mutex_unlock(&fwl_mutex);
 
-	dwork = to_delayed_work(work);
-
-	mutex_lock(&schedule_lock);
-	next_log += FWL_LOG_INTERVAL;
-	if (time_before(next_log, jiffies))
-		delay = 0;
-	else
-		delay = next_log - jiffies;
-	mutex_unlock(&schedule_lock);
-
-	(void)schedule_delayed_work(dwork, delay);
+	fwl_schedule_work(work);
 }
 
 /*
@@ -218,7 +233,7 @@ static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 		pos->on_sep = false;
 		if (pos->ptr && pos->word_pos != 0)
 			pos->on_sep = true;
-		pos->ptr = &word_list;
+		pos->ptr = words;
 		pos->word_pos = 0;
 	}
 }
@@ -492,6 +507,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		if (!next_idx) {
 			mutex_unlock(&fwl_mutex);
+			kfree(ofd_data->stash);
 			kfree(filp->private_data);
 			return -ENOSPC;
 		}
