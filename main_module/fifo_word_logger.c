@@ -91,22 +91,33 @@
 
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
+#define FWL_NODE_IDX u32
 
 struct fwl_word {
 	struct list_head node;
 	size_t len;
+	FWL_NODE_IDX idx;
 	char word[];
 };
 
 struct fwl_cursor {
 	struct list_head *ptr;
 	size_t word_pos;
+	FWL_NODE_IDX node_idx;
+	bool on_sep;
 };
 
 struct fwl_file {
 	struct fwl_cursor pos;
 	struct mutex lock;
 	struct fwl_word *stash;
+};
+
+/* bytes are not used yet */
+struct fwl_transaction_write {
+	struct list_head words;
+	struct fwl_word *stash;
+	size_t bytes;
 };
 
 static DEFINE_MUTEX(fwl_mutex);
@@ -124,6 +135,65 @@ static void fwl_pos_update(struct fwl_cursor *pos)
 	return;
 }
 
+static void fwl_cursor_set(struct fwl_cursor *pos)
+{
+	if (pos->node_idx < list_first->idx) {
+		pos->ptr = list_head;
+		if (pos->word_pos != 0)
+			pos->on_sep = true;
+	}
+}
+
+
+static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count)
+{
+	struct fwl_word *e;
+	size_t copy_size;
+	size_t idx = 0;
+	
+	// outside
+
+	// on start
+	if (pos->on_sep) {
+		buf[idx++] = FWL_WORD_SEP;
+		pos->ptr = pos->ptr->next;
+		pos->on_sep = false;
+		pos->word_pos = 0;
+	}
+	if (idx == count)
+		goto done;
+	// write first potentially partial word
+	if (pos->word_pos < e->len) {
+		copy_size = min(e->len - pos->word_pos, count);
+		memcpy(buf, e->word + pos->word_pos, copy_size);
+		idx += copy_size;
+		pos->word_pos += copy_size;
+		pos->on_sep = true;
+	}
+	
+	// write remaining words
+	while (idx < count) {
+		e = list_entry(pos->ptr, struct fwl_word, node);
+		copy_size = min(e->len, count - idx);
+		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
+		idx += copy_size;
+		pos->word_pos = copy_size;
+		if (idx == count)
+			return idx;
+		if (!list_is_last(pos->ptr, &word_list)) {
+			buf[idx++] = FWL_WORD_SEP;
+			pos->word_pos = 0;
+			pos->ptr = pos->ptr->next;
+		} else
+			return idx;
+	}
+
+done:
+	if (pos->word_pos == cur_word->len)
+		pos->on_sep = true;
+	return idx;
+}
+
 /*
  * fwl_read_from_pos()
  *
@@ -132,8 +202,7 @@ static void fwl_pos_update(struct fwl_cursor *pos)
  * - word_list not empty
  * - pos->ptr != NULL && !(pos->ptr == &word_list)
  */
-static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf,
-				 size_t count)
+static size_t fwl_read_from_pos_old(struct fwl_cursor *pos, char *buf, size_t count)
 {
 	struct fwl_word *e;
 	size_t copy_size;
@@ -220,8 +289,8 @@ static void fwl_word_list_clear(struct list_head *list)
  * suffix == NULL && suffix_len > 0
  */
 static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
-			  size_t prefix_len, const char *suffix,
-			  size_t suffix_len)
+			 size_t prefix_len, const char *suffix,
+			 size_t suffix_len)
 {
 	pr_debug("called\n");
 
@@ -249,41 +318,32 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 }
 
 /*
- * fwl_enlist_words()
- * 
- * Uses per ofd saved unfinished words from ofd_data->stash and the input buffer
- * to construct a list of words.
- *
- * On failure the whole list will be cleared and ofd_data->stash will stay
- * unmodified.
- *
- * On success ofd_data->stash will be either set to NULL or filled with a new
- * unfinished word.
+ * fwl_transaction_update()
  */
-static int fwl_enlist_words(struct list_head *list, struct file *filp,
-			     const char *buf, size_t buf_size)
+static int fwl_transaction_update(struct fwl_transaction_write *trans,
+				  const struct fwl_word *old_stash,
+				  const char *buf, size_t buf_size)
 {
 	pr_debug("called\n");
 
 	int ret = 0;
 	size_t idx = 0;
 	size_t wstart = 0;
-	struct fwl_file *ofd_data = filp->private_data;
 	struct fwl_word *new_word = NULL;
 
-	if (ofd_data->stash) {
+	if (old_stash) {
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
 			++idx;
 
-		ret = fwl_word_make(&new_word, ofd_data->stash->word,
-				     ofd_data->stash->len, buf, idx);
+		ret = fwl_word_make(&new_word, old_stash->word, old_stash->len,
+				    buf, idx);
 		if (ret)
 			goto failure;
 
 		if (idx == buf_size)
 			goto success;
 
-		list_add_tail(&new_word->node, list);
+		list_add_tail(&new_word->node, &trans->words);
 	}
 
 	while (idx < buf_size) {
@@ -297,23 +357,61 @@ static int fwl_enlist_words(struct list_head *list, struct file *filp,
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
 			++idx;
 
-		ret = fwl_word_make(&new_word, buf + wstart, idx - wstart,
-				     NULL, 0);
+		ret = fwl_word_make(&new_word, buf + wstart, idx - wstart, NULL,
+				    0);
 		if (ret)
 			goto failure;
 		if (idx == buf_size)
 			goto success;
 
-		list_add_tail(&new_word->node, list);
+		list_add_tail(&new_word->node, &trans->words);
 	}
 
 success:
-	kfree(ofd_data->stash);
-	ofd_data->stash = new_word;
-	return 0;
+	trans->stash = new_word;
 failure:
-	fwl_word_list_clear(list);
 	return ret;
+}
+
+/*
+ * fwl_transaction_clear()
+ */
+static void fwl_transaction_clear(struct fwl_transaction_write *trans)
+{
+	kfree(trans->stash);
+	fwl_word_list_clear(&trans->words);
+}
+
+/*
+ * fwl_transaction_commit()
+ *
+ * must hold both mutexes
+ *
+ * will fail when:
+ * - memory exhaustion (not implemented yet)
+ */
+static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
+					 struct fwl_file *ofd_data,
+					 struct list_head *word_list)
+{
+	static FWL_NODE_IDX next_idx = 1;
+	FWL_NODE_IDX tmp_idx = next_idx;
+	struct fwl_word *e;
+
+	list_for_each_entry(e, &trans->words, node) {
+		if (!tmp_idx)
+			return -ENOSPC;
+		e->idx = tmp_idx++;
+	}
+	next_idx = tmp_idx;
+
+	list_splice_tail_init(&trans->words, word_list);
+
+	kfree(ofd_data->stash);
+	ofd_data->stash = trans->stash;
+	trans->stash = NULL;
+
+	return 0;
 }
 
 /*
@@ -389,38 +487,43 @@ static int fwl_release(struct inode *inode, struct file *filp)
  * Both 1. and 2. are consistent with the byte ordering of individual writes.
  */
 static ssize_t fwl_write(struct file *filp, const char __user *buf,
-			  size_t count, loff_t *f_pos)
+			 size_t count, loff_t *f_pos)
 {
 	(void)f_pos;
+	int ret = 0;
+	struct fwl_file *ofd_data = filp->private_data;
+	struct fwl_transaction_write trans = {
+		.words = LIST_HEAD_INIT(trans.words), .stash = NULL, .bytes = 0
+	};
 
 	pr_debug("called\n");
 
-	LIST_HEAD(tmp_list);
-	int ret;
-	struct fwl_file *ofd_data = filp->private_data;
-
 	if (!count)
-		return 0;
+		goto zero_write;
 
 	char *devbuf = memdup_user(buf, count);
-	if (IS_ERR(devbuf))
-		return PTR_ERR(devbuf);
+	if (IS_ERR(devbuf)) {
+		ret = PTR_ERR(devbuf);
+		goto err_memdup_user;
+	}
 
 	mutex_lock(&ofd_data->lock);
 
-	ret = fwl_enlist_words(&tmp_list, filp, devbuf, count);
+	ret = fwl_transaction_update(&trans, ofd_data->stash, devbuf, count);
 	kfree(devbuf);
 	if (ret)
-		return ret;
+		goto err_fwl_transaction_update;
 
 	mutex_lock(&fwl_mutex);
-
-	list_splice_tail_init(&tmp_list, &word_list);
-
+	ret = fwl_transaction_commit_locked(&trans, ofd_data, &word_list);
 	mutex_unlock(&fwl_mutex);
-	mutex_unlock(&ofd_data->lock);
 
-	return count;
+err_fwl_transaction_update:
+	mutex_unlock(&ofd_data->lock);
+	fwl_transaction_clear(&trans);
+err_memdup_user:
+zero_write:
+	return ret ? ret : count;
 }
 
 /*
@@ -429,7 +532,7 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
  * Returns words joined with the single byte FWL_WORD_SEP.
  */
 static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
-			 loff_t *f_pos)
+			loff_t *f_pos)
 {
 	(void)f_pos;
 
