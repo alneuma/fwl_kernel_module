@@ -69,9 +69,13 @@
  * fwl_mutex
  * protects module wide shared state
  *
+ * schedule_lock
+ * protects log time scheduling
+ *
  * lock ordering
  * 1. ofd local lock
  * 2. fwl_mutex
+ * 3. schedule_lock
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -123,6 +127,7 @@ struct fwl_transaction_write {
 };
 
 static DEFINE_MUTEX(fwl_mutex);
+static DEFINE_MUTEX(schedule_lock);
 static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
@@ -130,6 +135,12 @@ static LIST_HEAD(word_list);
 static unsigned long next_log;
 static struct delayed_work fwl_work;
 static FWL_NODE_IDX next_idx = 1;
+
+/*
+ * debugging functions
+ */
+static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
+static void fwl_list_log(const struct list_head *l, const char *label);
 
 /* 
  * fwl_work_handler()
@@ -152,7 +163,12 @@ static void fwl_work_handler(struct work_struct *work)
 
 	mutex_lock(&fwl_mutex);
 
-	e = list_first_entry(&word_list, struct fwl_word, node);
+	e = list_first_entry_or_null(&word_list, struct fwl_word, node);
+	if (!e) {
+		mutex_unlock(&fwl_mutex);
+		return;
+	}
+
 	pr_info("%.*s\n", (int)e->len, e->word);
 	list_del(&e->node);
 	kfree(e);
@@ -166,20 +182,29 @@ static void fwl_work_handler(struct work_struct *work)
 
 	dwork = to_delayed_work(work);
 
+	mutex_lock(&schedule_lock);
 	next_log += FWL_LOG_INTERVAL;
 	if (time_before(next_log, jiffies))
 		delay = 0;
 	else
 		delay = next_log - jiffies;
+	mutex_unlock(&schedule_lock);
 
-	schedule_delayed_work(dwork, delay);
+	(void)schedule_delayed_work(dwork, delay);
 }
 
 /*
- * debugging functions
+ * fwl_start_logging()
+ * can not hold fwl_mutex while calling this
  */
-static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
-static void fwl_list_log(const struct list_head *l, const char *label);
+static void fwl_start_logging(void)
+{
+	(void)cancel_delayed_work_sync(&fwl_work);
+	mutex_lock(&schedule_lock);
+	next_log = jiffies + FWL_LOG_INTERVAL;
+	mutex_unlock(&schedule_lock);
+	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
+}
 
 /*
  * fwl_cursor_update()
@@ -402,13 +427,15 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
  * will fail when:
  * - memory exhaustion (not implemented yet)
  */
-static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
+static int fwl_transaction_commit_locked(bool *should_log,
+					 struct fwl_transaction_write *trans,
 					 struct fwl_file *ofd_data,
 					 struct list_head *words)
 {
 	FWL_NODE_IDX tmp_idx = next_idx;
 	struct fwl_word *e;
-	bool start_logging = false;
+
+	*should_log = false;
 
 	list_for_each_entry(e, &trans->words, node) {
 		if (!tmp_idx)
@@ -417,16 +444,10 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	}
 	next_idx = tmp_idx;
 
-	start_logging = list_empty(words);
+	if (list_empty(words) && !list_empty(&trans->words))
+		*should_log = true;
 
-	/* trans->words is not guaranteed to be non-empty */
 	list_splice_tail_init(&trans->words, words);
-
-	if (start_logging && !list_empty(words)) {
-		cancel_delayed_work_sync(&fwl_work);
-		next_log = jiffies + FWL_LOG_INTERVAL;
-		(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
-	}
 
 	kfree(ofd_data->stash);
 	ofd_data->stash = trans->stash;
@@ -459,11 +480,10 @@ static int fwl_open(struct inode *inode, struct file *filp)
  */
 static int fwl_release(struct inode *inode, struct file *filp)
 {
-
 	struct fwl_file *ofd_data = filp->private_data;
 	struct fwl_word *stash = ofd_data->stash;
 	ofd_data->stash = NULL;
-	bool start_logging = false;
+	bool should_log = false;
 
 	pr_debug("called\n");
 
@@ -477,17 +497,13 @@ static int fwl_release(struct inode *inode, struct file *filp)
 		}
 		stash->idx = next_idx++;
 
-		start_logging = list_empty(&word_list);
+		should_log = list_empty(&word_list);
 
 		list_add_tail(&stash->node, &word_list);
 
-		if (start_logging) {
-			cancel_delayed_work_sync(&fwl_work);
-			next_log = jiffies + FWL_LOG_INTERVAL;
-			(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
-		}
-
 		mutex_unlock(&fwl_mutex);
+		if (should_log)
+			fwl_start_logging();
 	}
 
 	kfree(filp->private_data);
@@ -530,6 +546,7 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 {
 	(void)f_pos;
 	int ret = 0;
+	bool should_log = false;
 	struct fwl_file *ofd_data = filp->private_data;
 	struct fwl_transaction_write trans = {
 		.words = LIST_HEAD_INIT(trans.words), .stash = NULL, .bytes = 0
@@ -554,7 +571,8 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 		goto err_fwl_transaction_update;
 
 	mutex_lock(&fwl_mutex);
-	ret = fwl_transaction_commit_locked(&trans, ofd_data, &word_list);
+	ret = fwl_transaction_commit_locked(&should_log, &trans, ofd_data,
+					    &word_list);
 	mutex_unlock(&fwl_mutex);
 
 err_fwl_transaction_update:
@@ -562,6 +580,8 @@ err_fwl_transaction_update:
 	fwl_transaction_clear(&trans);
 err_memdup_user:
 zero_write:
+	if (should_log)
+		fwl_start_logging();
 	return ret ? ret : count;
 }
 
