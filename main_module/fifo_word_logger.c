@@ -183,7 +183,7 @@ static void fwl_schedule_work(struct work_struct *work)
 /* 
  * fwl_work_handler()
  *
- * To counteract time drift the scheduling delay is calculated by subtracting
+ * To counteract timer drift the scheduling delay is calculated by subtracting
  * the current time from the ideal execution time of the next work item.
  *
  * In the exceptional case in which the current time is already past the ideal
@@ -212,14 +212,33 @@ static void fwl_work_handler(struct work_struct *work)
 
 /*
  * fwl_start_logging()
- * can not hold fwl_mutex while calling this
  *
- * TODO:
- * Problem: This is only called when word_list switched from empty to non-empty
- * In theory it is possible, that the work handler interacts with the word_list
- * and empties it immediately before the call to schedule_delayed_work().
- * I need to think about this scenario and ensure that it either does not happen
- * or is not a problem.
+ * contract
+ * (1) Should only be called right after word_list switches from empty to
+ * non-empty.
+ * (2) Can not hold fwl_mutex while calling this
+ *
+ * One could imagine the following scenario:
+ * 
+ * word_list switches from empty to non-empty and before schedule_delayed_work()
+ * is called, fwl_work_handler() consumes the only item from word_list causing
+ * schedule_delayed_work() to be called while word_list is empty.
+ *
+ * In this scenario one of the following can happen:
+ * 1. word_list is still empty, when fwl_work_handler() gets called and stays
+ * empty until after the potential consumtption. The work item will not
+ * self-reschedule in this case.
+ * 2. The list switches from empty to non-empty and fwl_start_logging() manages
+ * to call cancel_delayed_work_sync() before fwl_work_handler() gets called.
+ * The old work item will be descheduled and a new fresh one will be scheduled
+ * for the right point in time.
+ * 3. The list switches from empty to non-empty and fwl_start_logging() gets
+ * called before cancel_delayed_work_sync() is called. This is problematic,
+ * becuase, then the new word in word_list might be consumed much earlier than
+ * intended.
+ *
+ * TODO: Scenario 3. must be dealts with
+ *
  */
 static void fwl_start_logging(void)
 {
