@@ -397,7 +397,9 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
  *
  * must hold both mutexes
  *
- * We need to INIT_DELAYED_WORK
+ * We need to call INIT_DELAYED_WORK() every time we are want to schedule a work
+ * item in case, fwl_work_handler() is still executing on its list_empty() path
+ * when schedule_delayed_work() is called.
  *
  * will fail when:
  * - memory exhaustion (not implemented yet)
@@ -426,7 +428,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	if (start_logging && !list_empty(word_list)) {
 		INIT_DELAYED_WORK(&fwl_work, fwl_work_handler);
 		next_log = jiffies + FWL_LOG_INTERVAL;
-		schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
+		(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 	}
 
 	kfree(ofd_data->stash);
