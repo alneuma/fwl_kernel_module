@@ -168,11 +168,13 @@ static void fwl_schedule_work(struct work_struct *work)
 	unsigned long delay;
 
 	mutex_lock(&schedule_lock);
+
 	next_log += FWL_LOG_INTERVAL;
 	if (time_before(next_log, jiffies))
 		delay = 0;
 	else
 		delay = next_log - jiffies;
+
 	mutex_unlock(&schedule_lock);
 
 	(void)schedule_delayed_work(to_delayed_work(work), delay);
@@ -211,6 +213,13 @@ static void fwl_work_handler(struct work_struct *work)
 /*
  * fwl_start_logging()
  * can not hold fwl_mutex while calling this
+ *
+ * TODO:
+ * Problem: This is only called when word_list switched from empty to non-empty
+ * In theory it is possible, that the work handler interacts with the word_list
+ * and empties it immediately before the call to schedule_delayed_work().
+ * I need to think about this scenario and ensure that it either does not happen
+ * or is not a problem.
  */
 static void fwl_start_logging(void)
 {
