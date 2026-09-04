@@ -202,7 +202,8 @@ static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
  *
  * assumes words not empty
  */
-static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,  struct list_head *words)
+static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,
+				struct list_head *words)
 {
 	struct fwl_word *e;
 	size_t copy_size;
@@ -236,7 +237,7 @@ static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,
 
 		pos->on_sep = true;
 	}
-	
+
 done:
 	e = list_entry(pos->ptr, struct fwl_word, node);
 	if (pos->word_pos == e->len)
@@ -682,7 +683,7 @@ static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 static void fwl_list_log(const struct list_head *l, const char *label)
 {
 	struct fwl_word *e;
-	
+
 	pr_debug("%s:\n", label);
 	list_for_each_entry(e, l, node) {
 		pr_debug("node %u: %.*s\n", e->idx, (int)e->len, e->word);
