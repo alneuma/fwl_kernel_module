@@ -92,6 +92,8 @@
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
 #define FWL_NODE_IDX u32
+#define FWL_LOG_INTERVAL HZ
+#define FWL_LOG_INTERVAL HZ
 
 struct fwl_word {
 	struct list_head node;
@@ -125,6 +127,52 @@ static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
+static unsigned long next_log;
+static struct delayed_work fwl_work;
+
+/* 
+ * fwl_work_handler()
+ *
+ * To counteract time drift the scheduling delay is calculated by subtracting
+ * the current time from the ideal execution time of the next work item.
+ *
+ * If the actual time is already past this ideal execution time, the delay is
+ * set to 0.
+ *
+ * note:
+ * time_before() uses signed arithmetic for wraparound safety. This works within
+ * the limitations of the half-range rule.
+ */
+static void fwl_work_handler(struct work_struct *work)
+{
+	struct delayed_work *dwork;
+	struct fwl_word *e;
+	unsigned long delay;
+
+	mutex_lock(&fwl_mutex);
+
+	e = list_first_entry(&word_list, struct fwl_word, node);
+	pr_info("%.*s\n", (int)e->len, e->word);
+	list_del(&e->node);
+	kfree(e);
+
+	if (list_empty(&word_list)) {
+		mutex_unlock(&fwl_mutex);
+		return;
+	}
+
+	mutex_unlock(&fwl_mutex);
+
+	dwork = to_delayed_work(work);
+
+	next_log += FWL_LOG_INTERVAL;
+	if (time_before(next_log, jiffies))
+		delay = 0;
+	else
+		delay = next_log - jiffies;
+
+	schedule_delayed_work(dwork, delay);
+}
 
 /*
  * debugging functions
@@ -160,15 +208,7 @@ static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,
 	size_t copy_size;
 	size_t idx = 0;
 
-	fwl_list_log(words, "list");
-
-	pr_debug("count = %zu\n", count);
-
-	fwl_cursor_log(pos, "before");
-
 	fwl_cursor_update(pos, words);
-
-	fwl_cursor_log(pos, "after update");
 
 	while (idx < count) {
 		if (pos->on_sep) {
@@ -202,8 +242,6 @@ done:
 	if (pos->word_pos == e->len)
 		pos->on_sep = true;
 	pos->node_idx = e->idx;
-	fwl_cursor_log(pos, "after read");
-	pr_debug("buffer: %.*s\n", (int)idx, buf);
 	return idx;
 }
 
@@ -346,6 +384,8 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
  *
  * must hold both mutexes
  *
+ * We need to INIT_DELAYED_WORK
+ *
  * will fail when:
  * - memory exhaustion (not implemented yet)
  */
@@ -356,6 +396,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	static FWL_NODE_IDX next_idx = 1;
 	FWL_NODE_IDX tmp_idx = next_idx;
 	struct fwl_word *e;
+	bool start_logging = false;
 
 	list_for_each_entry(e, &trans->words, node) {
 		if (!tmp_idx)
@@ -364,7 +405,16 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	}
 	next_idx = tmp_idx;
 
+	start_logging = list_empty(word_list);
+
+	/* trans->words is not guaranteed to be non-empty */
 	list_splice_tail_init(&trans->words, word_list);
+
+	if (start_logging && !list_empty(word_list)) {
+		INIT_DELAYED_WORK(&fwl_work, fwl_work_handler);
+		next_log = jiffies + FWL_LOG_INTERVAL;
+		schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
+	}
 
 	kfree(ofd_data->stash);
 	ofd_data->stash = trans->stash;
@@ -379,7 +429,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
  */
 static int fwl_open(struct inode *inode, struct file *filp)
 {
-	pr_debug("called ###################################\n");
+	pr_debug("called\n");
 
 	struct fwl_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
