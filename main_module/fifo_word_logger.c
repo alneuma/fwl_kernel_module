@@ -127,6 +127,12 @@ static struct class *cls;
 static LIST_HEAD(word_list);
 
 /*
+ * debugging functions
+ */
+static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
+static void fwl_list_log(const struct list_head *l, const char *label);
+
+/*
  * fwl_cursor_update()
  * assumption: word not an empty list
  */
@@ -139,12 +145,10 @@ static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 		if (pos->ptr && pos->word_pos != 0)
 			pos->on_sep = true;
 		pos->ptr = &word_list;
-		pos->node_idx = e->idx;
 		pos->word_pos = 0;
 	}
 }
 
-//
 /*
  * fwl_read_from_pos()
  *
@@ -156,23 +160,34 @@ static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,
 	size_t copy_size;
 	size_t idx = 0;
 
+	fwl_list_log(words, "list");
+
+	pr_debug("count = %zu\n", count);
+
+	fwl_cursor_log(pos, "before");
+
 	fwl_cursor_update(pos, words);
+
+	fwl_cursor_log(pos, "after update");
 
 	while (idx < count) {
 		if (pos->on_sep) {
-			if (list_is_last(pos->ptr, words))
+			if (pos->word_pos != 0 && list_is_last(pos->ptr, words))
 				goto done;
 			buf[idx++] = FWL_WORD_SEP;
 			pos->ptr = pos->ptr->next;
 			pos->word_pos = 0;
-		}
+			pos->on_sep = false;
+		} else if (pos->ptr == words)
+			pos->ptr = pos->ptr->next;
+
 		if (idx == count)
 			goto done;
 
 		e = list_entry(pos->ptr, struct fwl_word, node);
 
 		copy_size = min(e->len - pos->word_pos, count - idx);
-		memcpy(buf, e->word + pos->word_pos, copy_size);
+		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
 		pos->on_sep = false;
 		pos->word_pos += copy_size;
 		idx += copy_size;
@@ -186,6 +201,9 @@ done:
 	e = list_entry(pos->ptr, struct fwl_word, node);
 	if (pos->word_pos == e->len)
 		pos->on_sep = true;
+	pos->node_idx = e->idx;
+	fwl_cursor_log(pos, "after read");
+	pr_debug("buffer: %.*s\n", (int)idx, buf);
 	return idx;
 }
 
@@ -361,7 +379,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
  */
 static int fwl_open(struct inode *inode, struct file *filp)
 {
-	pr_debug("called\n");
+	pr_debug("called ###################################\n");
 
 	struct fwl_file *ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
@@ -598,3 +616,25 @@ module_exit(fwl_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("alneuma");
 MODULE_DESCRIPTION("character device experiment using a list");
+
+/*
+ * debugging functions
+ */
+static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
+{
+	pr_debug("%s:\n", label);
+	pr_debug("ptr = %p\n", c->ptr);
+	pr_debug("word_pos = %zu\n", c->word_pos);
+	pr_debug("node_idx = %u\n", c->node_idx);
+	pr_debug("on_sep = %d\n", c->on_sep);
+}
+
+static void fwl_list_log(const struct list_head *l, const char *label)
+{
+	struct fwl_word *e;
+	
+	pr_debug("%s:\n", label);
+	list_for_each_entry(e, l, node) {
+		pr_debug("node %u: %.*s\n", e->idx, (int)e->len, e->word);
+	}
+}
