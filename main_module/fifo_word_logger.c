@@ -126,125 +126,66 @@ static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
 
-static void fwl_pos_update(struct fwl_cursor *pos)
+/*
+ * fwl_cursor_update()
+ * assumption: word not an empty list
+ */
+static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 {
-	if (!pos->ptr) {
-		pos->ptr = word_list.next;
-		pos->word_pos = 0;
-	}
-	return;
-}
+	struct fwl_word *e = list_first_entry(words, struct fwl_word, node);
 
-static void fwl_cursor_set(struct fwl_cursor *pos)
-{
-	if (pos->node_idx < list_first->idx) {
-		pos->ptr = list_head;
-		if (pos->word_pos != 0)
-			pos->on_sep = true;
-	}
-}
-
-
-static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count)
-{
-	struct fwl_word *e;
-	size_t copy_size;
-	size_t idx = 0;
-	
-	// outside
-
-	// on start
-	if (pos->on_sep) {
-		buf[idx++] = FWL_WORD_SEP;
-		pos->ptr = pos->ptr->next;
+	if (!pos->ptr || pos->node_idx < e->idx) {
 		pos->on_sep = false;
+		if (pos->ptr && pos->word_pos != 0)
+			pos->on_sep = true;
+		pos->ptr = &word_list;
+		pos->node_idx = e->idx;
 		pos->word_pos = 0;
 	}
-	if (idx == count)
-		goto done;
-	// write first potentially partial word
-	if (pos->word_pos < e->len) {
-		copy_size = min(e->len - pos->word_pos, count);
-		memcpy(buf, e->word + pos->word_pos, copy_size);
-		idx += copy_size;
-		pos->word_pos += copy_size;
-		pos->on_sep = true;
-	}
-	
-	// write remaining words
-	while (idx < count) {
-		e = list_entry(pos->ptr, struct fwl_word, node);
-		copy_size = min(e->len, count - idx);
-		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
-		idx += copy_size;
-		pos->word_pos = copy_size;
-		if (idx == count)
-			return idx;
-		if (!list_is_last(pos->ptr, &word_list)) {
-			buf[idx++] = FWL_WORD_SEP;
-			pos->word_pos = 0;
-			pos->ptr = pos->ptr->next;
-		} else
-			return idx;
-	}
-
-done:
-	if (pos->word_pos == cur_word->len)
-		pos->on_sep = true;
-	return idx;
 }
 
+//
 /*
  * fwl_read_from_pos()
  *
- * assumptions:
- * - fwl_mutex held
- * - word_list not empty
- * - pos->ptr != NULL && !(pos->ptr == &word_list)
+ * assumes words not empty
  */
-static size_t fwl_read_from_pos_old(struct fwl_cursor *pos, char *buf, size_t count)
+static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,  struct list_head *words)
 {
 	struct fwl_word *e;
 	size_t copy_size;
 	size_t idx = 0;
 
-	e = list_entry(pos->ptr, struct fwl_word, node);
+	fwl_cursor_update(pos, words);
 
-	/* copy first word */
-	if (pos->word_pos < e->len) {
-		copy_size = min(e->len - pos->word_pos, count);
-		memcpy(buf, e->word + pos->word_pos, copy_size);
-		idx += copy_size;
-		pos->word_pos += copy_size;
-	}
-	if (idx == count)
-		return idx;
-
-	/* copy separator */
-	if (!list_is_last(pos->ptr, &word_list)) {
-		buf[idx++] = FWL_WORD_SEP;
-		pos->word_pos = 0;
-		pos->ptr = pos->ptr->next;
-	} else
-		return idx;
-
-	/* copy remaining */
 	while (idx < count) {
-		e = list_entry(pos->ptr, struct fwl_word, node);
-		copy_size = min(e->len, count - idx);
-		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
-		idx += copy_size;
-		pos->word_pos = copy_size;
-		if (idx == count)
-			return idx;
-		if (!list_is_last(pos->ptr, &word_list)) {
+		if (pos->on_sep) {
+			if (list_is_last(pos->ptr, words))
+				goto done;
 			buf[idx++] = FWL_WORD_SEP;
-			pos->word_pos = 0;
 			pos->ptr = pos->ptr->next;
-		} else
-			return idx;
-	}
+			pos->word_pos = 0;
+		}
+		if (idx == count)
+			goto done;
 
+		e = list_entry(pos->ptr, struct fwl_word, node);
+
+		copy_size = min(e->len - pos->word_pos, count - idx);
+		memcpy(buf, e->word + pos->word_pos, copy_size);
+		pos->on_sep = false;
+		pos->word_pos += copy_size;
+		idx += copy_size;
+		if (idx == count)
+			goto done;
+
+		pos->on_sep = true;
+	}
+	
+done:
+	e = list_entry(pos->ptr, struct fwl_word, node);
+	if (pos->word_pos == e->len)
+		pos->on_sep = true;
 	return idx;
 }
 
@@ -564,15 +505,14 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 		return 0;
 	}
 
-	fwl_pos_update(&pos);
-	total_read = fwl_read_from_pos(&pos, tmp_buf, count);
+	total_read = fwl_read_from_pos(&pos, tmp_buf, count, &word_list);
 
 	mutex_unlock(&fwl_mutex);
 
 	if (copy_to_user(buf, tmp_buf, total_read))
 		ret = -EFAULT;
-	else
-		ofd_data->pos = pos;
+
+	ofd_data->pos = pos;
 
 	mutex_unlock(&ofd_data->lock);
 
