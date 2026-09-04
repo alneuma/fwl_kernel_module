@@ -129,6 +129,7 @@ static struct class *cls;
 static LIST_HEAD(word_list);
 static unsigned long next_log;
 static struct delayed_work fwl_work;
+static FWL_NODE_IDX next_idx = 1;
 
 /* 
  * fwl_work_handler()
@@ -396,19 +397,15 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
  * fwl_transaction_commit()
  *
  * must hold both mutexes
- *
- * We need to call INIT_DELAYED_WORK() every time we are want to schedule a work
- * item in case, fwl_work_handler() is still executing on its list_empty() path
- * when schedule_delayed_work() is called.
- *
+ *    git push --set-upstream origin feat/main-module
+
  * will fail when:
  * - memory exhaustion (not implemented yet)
  */
 static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 					 struct fwl_file *ofd_data,
-					 struct list_head *word_list)
+					 struct list_head *words)
 {
-	static FWL_NODE_IDX next_idx = 1;
 	FWL_NODE_IDX tmp_idx = next_idx;
 	struct fwl_word *e;
 	bool start_logging = false;
@@ -420,13 +417,13 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	}
 	next_idx = tmp_idx;
 
-	start_logging = list_empty(word_list);
+	start_logging = list_empty(words);
 
 	/* trans->words is not guaranteed to be non-empty */
-	list_splice_tail_init(&trans->words, word_list);
+	list_splice_tail_init(&trans->words, words);
 
-	if (start_logging && !list_empty(word_list)) {
-		INIT_DELAYED_WORK(&fwl_work, fwl_work_handler);
+	if (start_logging && !list_empty(words)) {
+		cancel_delayed_work_sync(&fwl_work);
 		next_log = jiffies + FWL_LOG_INTERVAL;
 		(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 	}
@@ -462,20 +459,38 @@ static int fwl_open(struct inode *inode, struct file *filp)
  */
 static int fwl_release(struct inode *inode, struct file *filp)
 {
-	pr_debug("called\n");
 
 	struct fwl_file *ofd_data = filp->private_data;
 	struct fwl_word *stash = ofd_data->stash;
 	ofd_data->stash = NULL;
+	bool start_logging = false;
+
+	pr_debug("called\n");
 
 	if (stash) {
 		mutex_lock(&fwl_mutex);
+
+		if (!next_idx) {
+			mutex_unlock(&fwl_mutex);
+			kfree(filp->private_data);
+			return -ENOSPC;
+		}
+		stash->idx = next_idx++;
+
+		start_logging = list_empty(&word_list);
+
 		list_add_tail(&stash->node, &word_list);
+
+		if (start_logging) {
+			cancel_delayed_work_sync(&fwl_work);
+			next_log = jiffies + FWL_LOG_INTERVAL;
+			(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
+		}
+
 		mutex_unlock(&fwl_mutex);
 	}
 
 	kfree(filp->private_data);
-
 	return 0;
 }
 
@@ -618,6 +633,8 @@ static int __init fwl_init(void)
 
 	pr_info("initializing %s ...\n", FWL_DRIVER_NAME);
 
+	INIT_DELAYED_WORK(&fwl_work, fwl_work_handler);
+
 	ret = alloc_chrdev_region(&devt, 0, 1, FWL_DRIVER_NAME);
 	if (ret) {
 		pr_err("failed to initialize %s: alloc_chrdev_region(): %d\n",
@@ -666,6 +683,7 @@ static void __exit fwl_exit(void)
 {
 	pr_info("cleaning up %s ...\n", FWL_DRIVER_NAME);
 
+	(void)cancel_delayed_work_sync(&fwl_work);
 	device_destroy(cls, devt);
 	class_destroy(cls);
 	cdev_del(&fifo_word_logger);
