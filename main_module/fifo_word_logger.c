@@ -114,13 +114,11 @@
  *
  * *** Caveats ***
  *
- * - Once a word is committed to the list, it will stay there forever.
  * - word length, list length, and memory occupied are unbound
- * - read() and write() buffers are dynamically allocated in the size of the
- *   buffers passed from userspace.
- * - no partial reads or writes are properly dealt with. Still partial reads
- *   can happen. The user must know, that in such cases the read cursor is not
- *   advanced.
+ * - read() buffers are dynamically allocated in the size of the buffers passed
+ *   from userspace.
+ * - Partial reads are not properly dealt with. Still partial reads can happen.
+ *   The user must know, that in such cases the read cursor is not advanced.
  *
  * Locks:
  *
