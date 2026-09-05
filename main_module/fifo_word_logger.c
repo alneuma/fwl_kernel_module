@@ -630,6 +630,11 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	};
 
 	(void)f_pos;
+	int ret = 0;
+	struct fwl_file *ofd_data = filp->private_data;
+	struct fwl_transaction_write trans = {
+		.words = LIST_HEAD_INIT(trans.words), .stash = NULL, .bytes = 0
+	};
 
 	pr_debug("called\n");
 
