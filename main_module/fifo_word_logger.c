@@ -179,7 +179,8 @@ struct fwl_file {
 struct fwl_transaction_write {
 	struct list_head words;
 	struct fwl_word *stash;
-	size_t bytes;
+	size_t bytes_copied;
+	size_t bytes_saved;
 };
 
 static DEFINE_MUTEX(fwl_mutex);
@@ -481,17 +482,9 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 
 success:
 	trans->stash = new_word;
+	trans->bytes_copied += buf_size;
 failure:
 	return ret;
-}
-
-/*
- * fwl_transaction_clear()
- */
-static void fwl_transaction_clear(struct fwl_transaction_write *trans)
-{
-	kfree(trans->stash);
-	fwl_word_list_clear(&trans->words);
 }
 
 /*
@@ -503,10 +496,11 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
  * will fail when:
  * - memory exhaustion (not implemented yet)
  */
-static int fwl_transaction_commit_locked(bool *should_log,
-					 struct fwl_transaction_write *trans,
+static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 					 struct fwl_file *ofd_data,
-					 struct list_head *words)
+					 struct list_head *words,
+					 bool *should_log,
+					 size_t *copied)
 {
 	u32 tmp_idx = next_idx;
 	struct fwl_word *e;
@@ -528,6 +522,8 @@ static int fwl_transaction_commit_locked(bool *should_log,
 	kfree(ofd_data->stash);
 	ofd_data->stash = trans->stash;
 	trans->stash = NULL;
+
+	*copied = trans->bytes_copied;
 
 	return 0;
 }
@@ -590,6 +586,58 @@ static int fwl_release(struct inode *inode, struct file *filp)
 }
 
 /*
+ * fwl_transaction_populate_locked()
+ *
+ * must hold ofd_data->lock
+ */
+static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans, struct fwl_file *ofd_data, const char __user *buf, size_t count, char *devbuf, size_t buf_size)
+{
+	size_t to_copy;
+	int ret = 0;
+	unsigned long missing;
+	struct fwl_word *stash = ofd_data->stash;
+	bool stash_owned = false;
+
+	INIT_LIST_HEAD(&trans->words);
+	trans->stash = NULL;
+	trans->bytes_saved = 0;
+	trans->bytes_copied = 0;
+
+	while (true) {
+
+		to_copy = min(buf_size, count - trans->bytes_copied);
+		missing = copy_from_user(devbuf, buf + trans->bytes_copied, to_copy);
+		if (missing == buf_size) {
+			if (trans->bytes_copied == 0)
+				ret = -EFAULT;
+			goto done;
+		}
+
+		to_copy -= missing;
+		ret = fwl_transaction_update(trans, stash, devbuf, to_copy);
+
+		if (stash_owned)
+			kfree(stash);
+
+		if (ret)
+			goto cleanup;
+
+		if (missing || trans->bytes_copied == count)
+			goto done;
+
+		stash = trans->stash;
+		trans->stash = NULL;
+		stash_owned = true;
+	}
+
+cleanup:
+	kfree(trans->stash);
+	fwl_word_list_clear(&trans->words);
+done:
+	return ret;
+}
+
+/*
  * fwl_write()
  *
  * To prevent an edgecases that would introduce unintuitive word ordering,
@@ -624,18 +672,12 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
 	size_t buf_size;
-	size_t to_copy;
-	int ret = 0;
-	bool should_log = false;
-	unsigned long missing;
-	size_t copied_total = 0;
+	size_t copied = 0;
 	char *devbuf;
-	bool stash_owned;
-	struct fwl_word *stash;
 	struct fwl_file *ofd_data = filp->private_data;
-	struct fwl_transaction_write trans = {
-		.words = LIST_HEAD_INIT(trans.words), .stash = NULL, .bytes = 0
-	};
+	struct fwl_transaction_write trans;
+	bool should_log = false;
+	int ret = 0;
 
 	pr_debug("called\n");
 
@@ -649,52 +691,26 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 
 	mutex_lock(&ofd_data->lock);
 
-	stash = ofd_data->stash;
-	stash_owned = false;
-
-	while (true) {
-
-		to_copy = min(buf_size, count - copied_total);
-		missing = copy_from_user(devbuf, buf + copied_total, to_copy);
-		if (missing == buf_size) {
-			if (copied_total == 0)
-				ret = -EFAULT;
-			goto done;
-		}
-
-		to_copy -= missing;
-		ret = fwl_transaction_update(&trans, stash, devbuf, to_copy);
-
-		if (stash_owned)
-			kfree(stash);
-
-		if (ret)
-			goto done;
-
-		copied_total += to_copy;
-
-		if (missing || copied_total == count)
-			break;
-
-		stash = trans.stash;
-		trans.stash = NULL;
-		stash_owned = true;
-	}
+	ret = fwl_transaction_populate_locked(&trans, ofd_data, buf, count,
+					      devbuf, buf_size);
+	kfree(devbuf);
+	if (ret)
+		goto done;
 
 	mutex_lock(&fwl_mutex);
-	ret = fwl_transaction_commit_locked(&should_log, &trans, ofd_data,
-					    &word_list);
+
+	ret = fwl_transaction_commit_locked(&trans, ofd_data, &word_list,
+					    &should_log, &copied);
+
 	mutex_unlock(&fwl_mutex);
 
 done:
 	mutex_unlock(&ofd_data->lock);
 
-	kfree(devbuf);
-	fwl_transaction_clear(&trans);
 	if (should_log)
 		fwl_start_logging();
 
-	return ret ? ret : count;
+	return ret ? ret : copied;
 }
 
 /*
