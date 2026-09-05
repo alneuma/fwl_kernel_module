@@ -437,6 +437,8 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 
 	(*new_word)->len = len;
 
+	pr_debug("leaving\n");
+
 	return 0;
 }
 
@@ -495,6 +497,7 @@ success:
 	trans->stash = new_word;
 	trans->bytes_copied += buf_size;
 failure:
+	pr_debug("leaving\n");
 	return ret;
 }
 
@@ -549,6 +552,7 @@ cleanup:
 	kfree(trans->stash);
 	fwl_word_list_clear(&trans->words);
 done:
+	pr_debug("leaving\n");
 	return ret;
 }
 
