@@ -197,12 +197,14 @@ static void fwl_list_log(const struct list_head *l, const char *label);
 static void fwl_consume_word(struct list_head *words)
 {
 	struct fwl_word *e;
+	int len;
 
 	e = list_first_entry_or_null(words, struct fwl_word, node);
 	if (!e)
 		return;
 
-	pr_info("%.*s\n", (int)e->len, e->word);
+	len = (int)min(e->len, (size_t)INT_MAX);
+	pr_info("%.*s\n", len, e->word);
 
 	list_del(&e->node);
 	kfree(e);
@@ -557,7 +559,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		if (!next_idx) {
 			mutex_unlock(&fwl_mutex);
-			kfree(ofd_data->stash);
+			kfree(stash);
 			kfree(filp->private_data);
 			return -ENOSPC;
 		}
@@ -696,7 +698,8 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 	if (copy_to_user(buf, tmp_buf, total_read))
 		ret = -EFAULT;
 
-	ofd_data->pos = pos;
+	if (!ret)
+		ofd_data->pos = pos;
 
 	mutex_unlock(&ofd_data->lock);
 
