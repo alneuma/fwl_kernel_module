@@ -124,6 +124,7 @@
  *
  * ofd local lock
  * protects ofd local state from concurrent reads/writes
+ * release() is excempt from this.
  *
  * fwl_mutex
  * protects module wide shared state
@@ -167,7 +168,7 @@ struct fwl_cursor {
 	bool on_sep;
 };
 
-struct fwl_file {
+struct fwl_ofd {
 	struct fwl_cursor pos;
 	struct mutex lock;
 	struct fwl_word *stash;
@@ -188,7 +189,7 @@ static struct class *cls;
 static LIST_HEAD(word_list);
 static unsigned long fwl_next_log;
 static struct delayed_work fwl_work;
-static u32 next_idx = 1;
+static u32 next_node_idx = 1;
 
 /*
  * debugging functions
@@ -364,7 +365,7 @@ done:
  * c == FWL_WORD_SEP is separately checked, in case FWL_WORD_SEP is not
  * within the set defined by isspace().
  */
-static int fwl_word_delim(char c)
+static bool fwl_word_delim(char c)
 {
 	return isspace((unsigned char)c) || c == 0x0 || c == FWL_WORD_SEP;
 }
@@ -403,6 +404,7 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 			 size_t suffix_len)
 {
 	size_t len;
+	size_t size;
 
 	pr_debug("called\n");
 
@@ -412,7 +414,7 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 	if (!len)
 		return -EINVAL;
 
-	const size_t size = struct_size(*new_word, word, len);
+	size = struct_size(*new_word, word, len);
 	if (size == SIZE_MAX)
 		return -EOVERFLOW;
 
@@ -491,13 +493,13 @@ failure:
  * must hold ofd_data->lock
  */
 static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
-					   struct fwl_file *ofd_data,
+					   struct fwl_ofd *ofd_data,
 					   const char __user *buf, size_t count,
 					   char *devbuf, size_t buf_size)
 {
 	size_t to_copy;
 	int ret = 0;
-	unsigned long missing;
+	unsigned long not_copied;
 	struct fwl_word *stash = ofd_data->stash;
 	bool stash_owned = false;
 
@@ -508,15 +510,15 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 
 	while (true) {
 		to_copy = min(buf_size, count - trans->bytes_copied);
-		missing = copy_from_user(devbuf, buf + trans->bytes_copied,
-					 to_copy);
-		if (missing == buf_size) {
+		not_copied = copy_from_user(devbuf, buf + trans->bytes_copied,
+					    to_copy);
+		if (not_copied == buf_size) {
 			if (trans->bytes_copied == 0)
 				ret = -EFAULT;
 			goto done;
 		}
 
-		to_copy -= missing;
+		to_copy -= not_copied;
 		ret = fwl_transaction_update(trans, stash, devbuf, to_copy);
 
 		if (stash_owned)
@@ -525,7 +527,7 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 		if (ret)
 			goto cleanup;
 
-		if (missing || trans->bytes_copied == count)
+		if (not_copied || trans->bytes_copied == count)
 			goto done;
 
 		stash = trans->stash;
@@ -544,17 +546,17 @@ done:
  * fwl_transaction_commit()
  *
  * must hold both mutexes
- *    git push --set-upstream origin feat/main-module
-
+ *
  * will fail when:
  * - memory exhaustion (not implemented yet)
+ * - node index exhaustion
  */
 static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
-					 struct fwl_file *ofd_data,
+					 struct fwl_ofd *ofd_data,
 					 struct list_head *words,
 					 bool *should_log, size_t *copied)
 {
-	u32 tmp_idx = next_idx;
+	u32 tmp_idx = next_node_idx;
 	struct fwl_word *e;
 
 	*should_log = false;
@@ -564,7 +566,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 			return -ENOSPC;
 		e->idx = tmp_idx++;
 	}
-	next_idx = tmp_idx;
+	next_node_idx = tmp_idx;
 
 	if (list_empty(words) && !list_empty(&trans->words))
 		*should_log = true;
@@ -586,7 +588,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
  */
 static int fwl_open(struct inode *inode, struct file *filp)
 {
-	struct fwl_file *ofd_data;
+	struct fwl_ofd *ofd_data;
 
 	pr_debug("called\n");
 
@@ -606,7 +608,7 @@ static int fwl_open(struct inode *inode, struct file *filp)
  */
 static int fwl_release(struct inode *inode, struct file *filp)
 {
-	struct fwl_file *ofd_data = filp->private_data;
+	struct fwl_ofd *ofd_data = filp->private_data;
 	struct fwl_word *stash = ofd_data->stash;
 	ofd_data->stash = NULL;
 	bool should_log = false;
@@ -616,13 +618,13 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	if (stash) {
 		mutex_lock(&fwl_mutex);
 
-		if (!next_idx) {
+		if (!next_node_idx) {
 			mutex_unlock(&fwl_mutex);
 			kfree(stash);
 			kfree(filp->private_data);
 			return -ENOSPC;
 		}
-		stash->idx = next_idx++;
+		stash->idx = next_node_idx++;
 
 		should_log = list_empty(&word_list);
 
@@ -674,7 +676,7 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	size_t buf_size;
 	size_t copied = 0;
 	char *devbuf;
-	struct fwl_file *ofd_data = filp->private_data;
+	struct fwl_ofd *ofd_data = filp->private_data;
 	struct fwl_transaction_write trans;
 	bool should_log = false;
 	int ret = 0;
@@ -725,7 +727,7 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 	char *tmp_buf;
 	int ret = 0;
 	size_t total_read;
-	struct fwl_file *ofd_data = filp->private_data;
+	struct fwl_ofd *ofd_data = filp->private_data;
 
 	(void)f_pos;
 
