@@ -153,6 +153,7 @@
 #define FWL_WORD_SEP ' '
 #define FWL_LOG_INTERVAL HZ
 #define FWL_MAX_BUF 1024
+#define FWL_MAX_MEM 128
 
 struct fwl_word {
 	struct list_head node;
@@ -179,7 +180,6 @@ struct fwl_transaction_write {
 	struct list_head words;
 	struct fwl_word *stash;
 	size_t bytes_copied;
-	size_t bytes_saved;
 };
 
 static DEFINE_MUTEX(fwl_mutex);
@@ -190,12 +190,18 @@ static LIST_HEAD(word_list);
 static unsigned long fwl_next_log;
 static struct delayed_work fwl_work;
 static u32 next_node_idx = 1;
+static size_t mem_used = 0;
 
 /*
  * debugging functions
  */
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
+
+static size_t fwl_word_size(const struct fwl_word *word)
+{
+	return struct_size(word, word, word->len);
+}
 
 /*
  * fwl_consume_word()
@@ -215,6 +221,8 @@ static bool fwl_consume_word(struct list_head *words)
 	}
 
 	list_del_init(&e->node);
+	mem_used -= fwl_word_size(e);
+
 	done = list_empty(&word_list);
 
 	mutex_unlock(&fwl_mutex);
@@ -474,6 +482,7 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 				    0);
 		if (ret)
 			goto failure;
+
 		if (idx == buf_size)
 			goto success;
 
@@ -505,7 +514,6 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 
 	INIT_LIST_HEAD(&trans->words);
 	trans->stash = NULL;
-	trans->bytes_saved = 0;
 	trans->bytes_copied = 0;
 
 	while (true) {
@@ -542,6 +550,42 @@ done:
 	return ret;
 }
 
+static int fwl_transaction_update_counters(struct fwl_transaction_write *trans,
+					 struct fwl_ofd *ofd_data)
+{
+	struct fwl_word *e;
+	size_t bytes = 0;
+	u32 tmp_idx = next_node_idx;
+
+	if (check_add_overflow(bytes, fwl_word_size(trans->stash), &bytes))
+		return -EOVERFLOW;
+
+	if (bytes > FWL_MAX_MEM)
+		return -ENOSPC; /* consider letting this block */
+
+	list_for_each_entry(e, &trans->words, node) {
+		if (!tmp_idx)
+			return -ENOSPC;
+		if (check_add_overflow(bytes, fwl_word_size(e), &bytes))
+			return -EOVERFLOW;
+		e->idx = tmp_idx++;
+	}
+
+	if (bytes > FWL_MAX_MEM)
+		return -ENOSPC; /* consider letting this block */
+
+	if (check_sub_overflow(bytes, fwl_word_size(ofd_data->stash), &bytes))
+		return -EOVERFLOW;
+
+	if (check_add_overflow(mem_used, bytes, &bytes))
+		return -EOVERFLOW;
+
+	next_node_idx = tmp_idx;
+	mem_used = bytes;
+
+	return 0;
+}
+
 /*
  * fwl_transaction_commit()
  *
@@ -556,17 +600,12 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 					 struct list_head *words,
 					 bool *should_log, size_t *copied)
 {
-	u32 tmp_idx = next_node_idx;
-	struct fwl_word *e;
-
+	int ret = 0;
 	*should_log = false;
 
-	list_for_each_entry(e, &trans->words, node) {
-		if (!tmp_idx)
-			return -ENOSPC;
-		e->idx = tmp_idx++;
-	}
-	next_node_idx = tmp_idx;
+	ret = fwl_transaction_update_counters(trans, ofd_data);
+	if (ret)
+		return ret;
 
 	if (list_empty(words) && !list_empty(&trans->words))
 		*should_log = true;
@@ -582,6 +621,12 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	return 0;
 }
 
+static void fwl_transaction_clear(struct fwl_transaction_write *trans)
+{
+	kfree(trans->stash);
+	fwl_word_list_clear(&trans->words);
+}
+
 /*
  * fwl_open()
  * initialized per ofd data
@@ -589,6 +634,8 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 static int fwl_open(struct inode *inode, struct file *filp)
 {
 	struct fwl_ofd *ofd_data;
+	size_t mem_tmp;
+	size_t ret = 0;
 
 	pr_debug("called\n");
 
@@ -599,7 +646,16 @@ static int fwl_open(struct inode *inode, struct file *filp)
 	mutex_init(&ofd_data->lock);
 	filp->private_data = ofd_data;
 
-	return 0;
+	mutex_lock(&fwl_mutex);
+	if (check_add_overflow(mem_used, sizeof(*ofd_data), &mem_tmp))
+		ret = -EOVERFLOW;
+	else if (mem_tmp > FWL_MAX_MEM)
+		ret = -ENOSPC;
+	else
+		mem_used = mem_tmp;
+	mutex_unlock(&fwl_mutex);
+
+	return ret;
 }
 
 /*
@@ -636,6 +692,11 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	}
 
 	kfree(filp->private_data);
+
+	mutex_lock(&fwl_mutex);
+	mem_used -= sizeof(struct fwl_ofd);
+	mutex_unlock(&fwl_mutex);
+
 	return 0;
 }
 
@@ -705,9 +766,11 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 					    &should_log, &copied);
 
 	mutex_unlock(&fwl_mutex);
-
 done:
 	mutex_unlock(&ofd_data->lock);
+
+	if (ret)
+		fwl_transaction_clear(&trans);
 
 	if (should_log)
 		fwl_start_logging();
