@@ -458,10 +458,7 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
 			++idx;
 
-		if (old_stash)
-			ret = fwl_word_make(&new_word, old_stash->word, old_stash->len, buf, idx);
-		else
-			ret = fwl_word_make(&new_word, NULL, 0, buf, idx);
+		ret = fwl_word_make(&new_word, old_stash->word, old_stash->len, buf, idx);
 
 		if (ret)
 			goto failure;
@@ -780,6 +777,8 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	mutex_unlock(&fwl_mutex);
 done:
 	mutex_unlock(&ofd_data->lock);
+
+	pr_debug("ret: %d\n", ret);
 
 	if (ret)
 		fwl_transaction_clear(&trans);
