@@ -5,9 +5,10 @@
  * Once per second the oldest word is logged and removed from the queue.
  * Counting starts as soon as the queue moves from empty to non-empty.
  *
- * Interface:
+ * *** Interface ***
  *
  * write()
+ *
  * Splits content of the buffer into words and appends these words to the queue.
  * A word is any sequence of bytes that is surrounded by separators.
  * A separator is any byte, that is FWL_WORD_SEP, the zero byte or any byte
@@ -33,12 +34,13 @@
  *
  * This behavior is implemented saving per ofd state of unfinished word: Any
  * word that remains unfinished (i.e. without a separator to its right) after a
- * call to read() is not committed to the queue, but insted saved as ofd private
- * data. When na ofd is released any remaining unfinished word is commited to
+ * call to read() is not committed to the queue, but instead saved as ofd private
+ * data. When na ofd is released any remaining unfinished word is committed to
  * the queue.
  *
  * read()
- * Writes all the currently enqueud words to the read buffer, separated by
+ *
+ * Writes all the currently enqueued words to the read buffer, separated by
  * FWL_WORD_SEP. The read position is saved per ofd.
  * It can occur, that between two calls to read() this position becomes
  * invalidated. This happens if between the two calls the word this position
@@ -48,12 +50,63 @@
  * read of the now dequeued word.
  *
  * When there are currently no more words to read, then EOF gets returned,
- * although more words could be commited later.
- * We might want to implement polling here.
+ * although more words could be committed later.
+ * We might want to implement polling later.
  *
- * Caveats:
+ * *** logging semantics and implementation ***
+ * 
+ * A new logging sequence starts when the state of the queue switches from empty 
+ * to non-empty. The first logging event of a new sequence happens one second
+ * after the sequence started. During each logging event the first word in the
+ * queue will be removed from the queue and logged. If it was the last word in
+ * the queue the logging sequence stops. A logging sequence is implemented by a
+ * self rescheduling delayed word item.
  *
- * - Once a word is commited to the list, it will stay there forever.
+ * Thoughts about concurrency:
+ * So the to relevant events for controlling the logging are associated with
+ * changes in the queue's state:
+ *
+ * (1) empty -> non-empty causes logging to start
+ * (2) non-empty -> empty causes logging to stop
+ *
+ * Questions of concurrency are simplified by the following:
+ * - Event (1) is entirely controlled by the fwl_write() and fwl_release(). If
+ *   any of them causes (1) it will start a logging sequence
+ * - Event (2) is entirely controlled by fwl_work_handler(), the callback
+ *   function of the work item, which will not self reschedule if it causes (2)
+ *   and thus stop the logging sequence.
+ * - Each of those events is locked to happen atomically.
+ *
+ * This gives the following guarantees:
+ * (a) When the queue is empty there is either no work item scheduled or the
+ *     callback has reached a stage in which it can no longer cause event (1)
+ *     and will not reschedule.
+ * (b) When the queue is non-empty no thread is in a stage where it can attempt
+ *     to start logging.
+ * (c) Because of (a), (1) can only happen in a context in which no work item
+ *     that could cause (2) is scheduled.
+ * (d) Because of (b) fwl_work_handler() can only reschedule itself in a context 
+ *     in which no thread could attempt to start logging.
+ * (e) Because of the atomicity of (1) it is impossible that multiple threads
+ *     are contesting for starting logging: When one thread exits the critical
+ *     section during which it caused (1), the queue's state has already changed
+ *     to non-empty. So no other thread will be contesting for starting the
+ *     logging sequence.
+ * (f) (c), (d) and (e) guarantee, that access to the shared variable
+ *     fwl_fwl_next_log will always be uncontested.
+ *
+ * One imaginative edge cases:
+ *
+ * 1. Thread A causes (1) then leaves the critical section.
+ * 2. A work item that was still pending causes (2).
+ * 3. Thread B causes (1)
+ * 4. Thread A and Thread B are contenting for starting logging.
+ *
+ * But (c) rules out 2., so this can never happen.
+ *
+ * *** Caveats ***
+ *
+ * - Once a word is committed to the list, it will stay there forever.
  * - word length, list length, and memory occupied are unbound
  * - read() and write() buffers are dynamically allocated in the size of the
  *   buffers passed from userspace.
@@ -69,13 +122,9 @@
  * fwl_mutex
  * protects module wide shared state
  *
- * schedule_lock
- * protects log time scheduling
- *
  * lock ordering
  * 1. ofd local lock
  * 2. fwl_mutex
- * 3. schedule_lock
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -127,12 +176,11 @@ struct fwl_transaction_write {
 };
 
 static DEFINE_MUTEX(fwl_mutex);
-static DEFINE_MUTEX(schedule_lock);
 static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
-static unsigned long next_log;
+static unsigned long fwl_next_log;
 static struct delayed_work fwl_work;
 static FWL_NODE_IDX next_idx = 1;
 
@@ -167,15 +215,11 @@ static void fwl_schedule_work(struct work_struct *work)
 {
 	unsigned long delay;
 
-	mutex_lock(&schedule_lock);
-
-	next_log += FWL_LOG_INTERVAL;
-	if (time_before(next_log, jiffies))
+	fwl_next_log += FWL_LOG_INTERVAL;
+	if (time_before(fwl_next_log, jiffies))
 		delay = 0;
 	else
-		delay = next_log - jiffies;
-
-	mutex_unlock(&schedule_lock);
+		delay = fwl_next_log - jiffies;
 
 	(void)schedule_delayed_work(to_delayed_work(work), delay);
 }
@@ -195,7 +239,6 @@ static void fwl_schedule_work(struct work_struct *work)
  */
 static void fwl_work_handler(struct work_struct *work)
 {
-
 	mutex_lock(&fwl_mutex);
 
 	fwl_consume_word(&word_list);
@@ -218,34 +261,13 @@ static void fwl_work_handler(struct work_struct *work)
  * non-empty.
  * (2) Can not hold fwl_mutex while calling this
  *
- * One could imagine the following scenario:
- * 
- * word_list switches from empty to non-empty and before schedule_delayed_work()
- * is called, fwl_work_handler() consumes the only item from word_list causing
- * schedule_delayed_work() to be called while word_list is empty.
- *
- * In this scenario one of the following can happen:
- * 1. word_list is still empty, when fwl_work_handler() gets called and stays
- * empty until after the potential consumtption. The work item will not
- * self-reschedule in this case.
- * 2. The list switches from empty to non-empty and fwl_start_logging() manages
- * to call cancel_delayed_work_sync() before fwl_work_handler() gets called.
- * The old work item will be descheduled and a new fresh one will be scheduled
- * for the right point in time.
- * 3. The list switches from empty to non-empty and fwl_start_logging() gets
- * called before cancel_delayed_work_sync() is called. This is problematic,
- * becuase, then the new word in word_list might be consumed much earlier than
- * intended.
- *
- * TODO: Scenario 3. must be dealts with
- *
+ * See "logging semantics and implementation" in the top most comment for a
+ * discussion on concurrency.
  */
 static void fwl_start_logging(void)
 {
 	(void)cancel_delayed_work_sync(&fwl_work);
-	mutex_lock(&schedule_lock);
-	next_log = jiffies + FWL_LOG_INTERVAL;
-	mutex_unlock(&schedule_lock);
+	fwl_next_log = jiffies + FWL_LOG_INTERVAL;
 	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 }
 
