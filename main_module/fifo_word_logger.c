@@ -153,6 +153,7 @@
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
 #define FWL_LOG_INTERVAL HZ
+#define FWL_MAX_BUF 1024
 
 struct fwl_word {
 	struct list_head node;
@@ -622,15 +623,15 @@ static int fwl_release(struct inode *inode, struct file *filp)
 static ssize_t fwl_write(struct file *filp, const char __user *buf,
 			 size_t count, loff_t *f_pos)
 {
+	size_t buf_size;
+	size_t to_copy;
 	int ret = 0;
 	bool should_log = false;
-	struct fwl_file *ofd_data = filp->private_data;
-	struct fwl_transaction_write trans = {
-		.words = LIST_HEAD_INIT(trans.words), .stash = NULL, .bytes = 0
-	};
-
-	(void)f_pos;
-	int ret = 0;
+	unsigned long missing;
+	size_t copied_total = 0;
+	char *devbuf;
+	bool stash_owned;
+	struct fwl_word *stash;
 	struct fwl_file *ofd_data = filp->private_data;
 	struct fwl_transaction_write trans = {
 		.words = LIST_HEAD_INIT(trans.words), .stash = NULL, .bytes = 0
@@ -639,33 +640,59 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	pr_debug("called\n");
 
 	if (!count)
-		goto zero_write;
+		return 0;
 
-	char *devbuf = memdup_user(buf, count);
-	if (IS_ERR(devbuf)) {
-		ret = PTR_ERR(devbuf);
-		goto err_memdup_user;
-	}
+	buf_size = min(count, FWL_MAX_BUF);
+	devbuf = kmalloc(buf_size, GFP_KERNEL);
+	if (!devbuf)
+		return -ENOMEM;
 
 	mutex_lock(&ofd_data->lock);
 
-	ret = fwl_transaction_update(&trans, ofd_data->stash, devbuf, count);
+	stash = ofd_data->stash;
+	stash_owned = false;
+
+	while (copied_total < count) {
+
+		to_copy = min(buf_size, count - copied_total);
+		missing = copy_from_user(devbuf, buf + copied_total, to_copy);
+		if (missing == buf_size) {
+			if (copied_total == 0)
+				ret = -EFAULT;
+			goto done;
+		}
+
+		to_copy -= missing;
+		ret = fwl_transaction_update(&trans, stash, devbuf, to_copy);
+
+		if (stash_owned)
+			kfree(stash);
+
+		if (ret)
+			goto done;
+
+		copied_total += to_copy;
+
+		if (missing || copied_total == count)
+			break;
+
+		stash = trans.stash;
+		trans.stash = NULL;
+		stash_owned = true;
+	}
 	kfree(devbuf);
-	if (ret)
-		goto err_fwl_transaction_update;
 
 	mutex_lock(&fwl_mutex);
 	ret = fwl_transaction_commit_locked(&should_log, &trans, ofd_data,
 					    &word_list);
 	mutex_unlock(&fwl_mutex);
 
-err_fwl_transaction_update:
+done:
 	mutex_unlock(&ofd_data->lock);
 	fwl_transaction_clear(&trans);
-err_memdup_user:
-zero_write:
 	if (should_log)
 		fwl_start_logging();
+
 	return ret ? ret : count;
 }
 
