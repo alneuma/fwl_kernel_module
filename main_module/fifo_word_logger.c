@@ -153,7 +153,7 @@
 #define FWL_WORD_SEP ' '
 #define FWL_LOG_INTERVAL HZ
 #define FWL_MAX_BUF 1024
-#define FWL_MAX_MEM 128
+#define FWL_MAX_MEM 4096
 
 struct fwl_word {
 	struct list_head node;
@@ -222,6 +222,8 @@ static bool fwl_consume_word(struct list_head *words)
 
 	list_del_init(&e->node);
 	mem_used -= fwl_word_size(e);
+
+	pr_debug("mem_used: %zu\n", mem_used);
 
 	done = list_empty(&word_list);
 
@@ -456,8 +458,11 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
 			++idx;
 
-		ret = fwl_word_make(&new_word, old_stash->word, old_stash->len,
-				    buf, idx);
+		if (old_stash)
+			ret = fwl_word_make(&new_word, old_stash->word, old_stash->len, buf, idx);
+		else
+			ret = fwl_word_make(&new_word, NULL, 0, buf, idx);
+
 		if (ret)
 			goto failure;
 
@@ -618,6 +623,10 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 
 	*copied = trans->bytes_copied;
 
+	mutex_lock(&fwl_mutex);
+	pr_debug("mem_used: %zu\n", mem_used);
+	mutex_unlock(&fwl_mutex);
+
 	return 0;
 }
 
@@ -634,7 +643,7 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
 static int fwl_open(struct inode *inode, struct file *filp)
 {
 	struct fwl_ofd *ofd_data;
-	size_t mem_tmp;
+	size_t mem_tmp = 0;
 	size_t ret = 0;
 
 	pr_debug("called\n");
@@ -654,6 +663,9 @@ static int fwl_open(struct inode *inode, struct file *filp)
 	else
 		mem_used = mem_tmp;
 	mutex_unlock(&fwl_mutex);
+
+	if (ret)
+		kfree(filp->private_data);
 
 	return ret;
 }
