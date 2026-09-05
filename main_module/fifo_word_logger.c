@@ -488,6 +488,61 @@ failure:
 }
 
 /*
+ * fwl_transaction_populate_locked()
+ *
+ * must hold ofd_data->lock
+ */
+static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
+					   struct fwl_file *ofd_data,
+					   const char __user *buf, size_t count,
+					   char *devbuf, size_t buf_size)
+{
+	size_t to_copy;
+	int ret = 0;
+	unsigned long missing;
+	struct fwl_word *stash = ofd_data->stash;
+	bool stash_owned = false;
+
+	INIT_LIST_HEAD(&trans->words);
+	trans->stash = NULL;
+	trans->bytes_saved = 0;
+	trans->bytes_copied = 0;
+
+	while (true) {
+		to_copy = min(buf_size, count - trans->bytes_copied);
+		missing = copy_from_user(devbuf, buf + trans->bytes_copied,
+					 to_copy);
+		if (missing == buf_size) {
+			if (trans->bytes_copied == 0)
+				ret = -EFAULT;
+			goto done;
+		}
+
+		to_copy -= missing;
+		ret = fwl_transaction_update(trans, stash, devbuf, to_copy);
+
+		if (stash_owned)
+			kfree(stash);
+
+		if (ret)
+			goto cleanup;
+
+		if (missing || trans->bytes_copied == count)
+			goto done;
+
+		stash = trans->stash;
+		trans->stash = NULL;
+		stash_owned = true;
+	}
+
+cleanup:
+	kfree(trans->stash);
+	fwl_word_list_clear(&trans->words);
+done:
+	return ret;
+}
+
+/*
  * fwl_transaction_commit()
  *
  * must hold both mutexes
@@ -499,8 +554,7 @@ failure:
 static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 					 struct fwl_file *ofd_data,
 					 struct list_head *words,
-					 bool *should_log,
-					 size_t *copied)
+					 bool *should_log, size_t *copied)
 {
 	u32 tmp_idx = next_idx;
 	struct fwl_word *e;
@@ -583,58 +637,6 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 	kfree(filp->private_data);
 	return 0;
-}
-
-/*
- * fwl_transaction_populate_locked()
- *
- * must hold ofd_data->lock
- */
-static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans, struct fwl_file *ofd_data, const char __user *buf, size_t count, char *devbuf, size_t buf_size)
-{
-	size_t to_copy;
-	int ret = 0;
-	unsigned long missing;
-	struct fwl_word *stash = ofd_data->stash;
-	bool stash_owned = false;
-
-	INIT_LIST_HEAD(&trans->words);
-	trans->stash = NULL;
-	trans->bytes_saved = 0;
-	trans->bytes_copied = 0;
-
-	while (true) {
-
-		to_copy = min(buf_size, count - trans->bytes_copied);
-		missing = copy_from_user(devbuf, buf + trans->bytes_copied, to_copy);
-		if (missing == buf_size) {
-			if (trans->bytes_copied == 0)
-				ret = -EFAULT;
-			goto done;
-		}
-
-		to_copy -= missing;
-		ret = fwl_transaction_update(trans, stash, devbuf, to_copy);
-
-		if (stash_owned)
-			kfree(stash);
-
-		if (ret)
-			goto cleanup;
-
-		if (missing || trans->bytes_copied == count)
-			goto done;
-
-		stash = trans->stash;
-		trans->stash = NULL;
-		stash_owned = true;
-	}
-
-cleanup:
-	kfree(trans->stash);
-	fwl_word_list_clear(&trans->words);
-done:
-	return ret;
 }
 
 /*
