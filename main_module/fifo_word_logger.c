@@ -204,7 +204,8 @@ static size_t mem_used = 0;
  */
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
-static void fwl_transaction_log(const struct fwl_transaction_write *t, const char *label);
+static void fwl_transaction_log(const struct fwl_transaction_write *t,
+				const char *label);
 
 static size_t fwl_word_size(const struct fwl_word *word)
 {
@@ -212,9 +213,9 @@ static size_t fwl_word_size(const struct fwl_word *word)
 }
 
 /*
- * fwl_consume_word()
+ * fwl_consume_first_word()
  */
-static bool fwl_consume_word(struct list_head *words)
+static bool fwl_consume_first_word(struct list_head *words)
 {
 	struct fwl_word *e;
 	int len;
@@ -275,7 +276,7 @@ static void fwl_schedule_work(struct work_struct *work)
  */
 static void fwl_work_handler(struct work_struct *work)
 {
-	bool done = fwl_consume_word(&word_list);
+	bool done = fwl_consume_first_word(&word_list);
 
 	if (!done)
 		fwl_schedule_work(work);
@@ -466,7 +467,8 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
 			++idx;
 
-		ret = fwl_word_make(&new_word, old_stash->word, old_stash->len, buf, idx);
+		ret = fwl_word_make(&new_word, old_stash->word, old_stash->len,
+				    buf, idx);
 
 		if (ret)
 			goto failure;
@@ -563,22 +565,23 @@ done:
 /*
  * fwl_transaction_update_counters_locked()
  *
- * Assigns indeces to transaction list and updates total memory usage.
+ * Assigns indices to transaction list and updates total memory usage.
  * On failure no shared state will be modified.
  *
  * will fail when:
  * - memory exhaustion
  * - node index exhaustion
  */
-static int fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
-					 struct fwl_ofd *ofd_data)
+static int
+fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
+				       struct fwl_ofd *ofd_data)
 {
 	struct fwl_word *e;
 	size_t bytes = 0;
 	u32 tmp_idx = next_node_idx;
 
 	if (trans->stash &&
-			check_add_overflow(bytes, fwl_word_size(trans->stash), &bytes))
+	    check_add_overflow(bytes, fwl_word_size(trans->stash), &bytes))
 		return -EOVERFLOW;
 
 	if (bytes > FWL_MAX_MEM)
@@ -595,7 +598,8 @@ static int fwl_transaction_update_counters_locked(struct fwl_transaction_write *
 	if (bytes > FWL_MAX_MEM)
 		return -ENOSPC; /* consider letting this block */
 
-	if (ofd_data->stash && check_sub_overflow(bytes, fwl_word_size(ofd_data->stash), &bytes))
+	if (ofd_data->stash &&
+	    check_sub_overflow(bytes, fwl_word_size(ofd_data->stash), &bytes))
 		return -EOVERFLOW;
 
 	if (check_add_overflow(mem_used, bytes, &bytes))
@@ -658,6 +662,8 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
 /*
  * fwl_open()
  * initialized per ofd data
+ * TODO: consider reserving an index when opening, such that closing can never
+ * return -ENOSPC. The current version is slightly awkward.
  */
 static int fwl_open(struct inode *inode, struct file *filp)
 {
@@ -692,6 +698,8 @@ static int fwl_open(struct inode *inode, struct file *filp)
 /*
  * fwl_release()
  * cleans up and commits any unfinished words from per ofd_data->stash to list
+ * TODO: consider reserving an index when opening, such that closing can never
+ * return -ENOSPC. The current version is slightly awkward.
  */
 static int fwl_release(struct inode *inode, struct file *filp)
 {
@@ -754,7 +762,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
  *
  * "World" -- "Hello"
  *
- * will be appended to the shared list, which is inconsitent with the order of
+ * will be appended to the shared list, which is inconsistent with the order of
  * bytes in A's write.
  *
  * With the mutex protection one of the following will be appended:
@@ -953,10 +961,11 @@ MODULE_DESCRIPTION("character device experiment using a list");
 /*
  * debugging functions
  */
-static void fwl_transaction_log(const struct fwl_transaction_write *t, const char *label)
+static void fwl_transaction_log(const struct fwl_transaction_write *t,
+				const char *label)
 {
 	pr_debug("%s:\n", label);
-	
+
 	pr_debug("t->stash = %p\n", t->stash);
 	pr_debug("t->bytes_copied = %zu\n", t->bytes_copied);
 }
