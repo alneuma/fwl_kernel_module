@@ -61,6 +61,13 @@
  * the next index to assign would be 0. We know that the next_index variable has
  * wrapped around and the pool of indices is exhausted.
  *
+ * *** memory limits ***
+ * 
+ * There is a maximum number of bytes that is allowed to be occupied by the
+ * persistent device state. Object counted are:
+ * - nodes of the queue
+ * - per ofd private data
+ *
  * *** logging semantics and implementation ***
  * 
  * A new logging sequence starts when the state of the queue switches from empty 
@@ -88,7 +95,7 @@
  * This gives the following guarantees:
  * (a) When the queue is empty there is either no work item scheduled or the
  *     callback has reached a stage in which it can no longer cause event (1)
- *     and will not reschedule.
+ *     and has already determined that it will not reschedule.
  * (b) When the queue is non-empty no thread is in a stage where it can attempt
  *     to start logging.
  * (c) Because of (a), (1) can only happen in a context in which no work item
@@ -114,7 +121,7 @@
  *
  * *** Caveats ***
  *
- * - word length, list length, and memory occupied are unbound
+ * - word length, list length are unbound
  * - read() buffers are dynamically allocated in the size of the buffers passed
  *   from userspace.
  * - Partial reads are not properly dealt with. Still partial reads can happen.
@@ -224,9 +231,8 @@ static bool fwl_consume_word(struct list_head *words)
 	list_del_init(&e->node);
 	mem_used -= fwl_word_size(e);
 
-#ifdef DEBUG
 	pr_debug("mem_used: %zu\n", mem_used);
-#endif
+
 	done = list_empty(&word_list);
 
 	mutex_unlock(&fwl_mutex);
@@ -524,7 +530,7 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 		to_copy = min(buf_size, count - trans->bytes_copied);
 		not_copied = copy_from_user(devbuf, buf + trans->bytes_copied,
 					    to_copy);
-		if (not_copied == buf_size) {
+		if (not_copied == to_copy) {
 			if (trans->bytes_copied == 0)
 				ret = -EFAULT;
 			goto done;
@@ -554,7 +560,17 @@ done:
 	return ret;
 }
 
-static int fwl_transaction_update_counters(struct fwl_transaction_write *trans,
+/*
+ * fwl_transaction_update_counters_locked()
+ *
+ * Assigns indeces to transaction list and updates total memory usage.
+ * On failure no shared state will be modified.
+ *
+ * will fail when:
+ * - memory exhaustion
+ * - node index exhaustion
+ */
+static int fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 					 struct fwl_ofd *ofd_data)
 {
 	struct fwl_word *e;
@@ -597,7 +613,7 @@ static int fwl_transaction_update_counters(struct fwl_transaction_write *trans,
  * must hold both mutexes
  *
  * will fail when:
- * - memory exhaustion (not implemented yet)
+ * - memory exhaustion
  * - node index exhaustion
  */
 static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
@@ -608,7 +624,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	int ret = 0;
 	*should_log = false;
 
-	ret = fwl_transaction_update_counters(trans, ofd_data);
+	ret = fwl_transaction_update_counters_locked(trans, ofd_data);
 	if (ret)
 		return ret;
 
@@ -623,12 +639,16 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 
 	*copied = trans->bytes_copied;
 
-#ifdef DEBUG
 	pr_debug("mem_used: %zu\n", mem_used);
-#endif
+
 	return 0;
 }
 
+/*
+ * fwl_transaction_clear()
+ *
+ * frees resources held by a transaction
+ */
 static void fwl_transaction_clear(struct fwl_transaction_write *trans)
 {
 	kfree(trans->stash);
@@ -686,6 +706,8 @@ static int fwl_release(struct inode *inode, struct file *filp)
 		mutex_lock(&fwl_mutex);
 
 		if (!next_node_idx) {
+			mem_used -= sizeof(struct fwl_ofd);
+			mem_used -= sizeof(*stash);
 			mutex_unlock(&fwl_mutex);
 			kfree(stash);
 			kfree(filp->private_data);
@@ -704,11 +726,9 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 	kfree(filp->private_data);
 
-#ifdef DEBUG
 	mutex_lock(&fwl_mutex);
 	mem_used -= sizeof(struct fwl_ofd);
 	mutex_unlock(&fwl_mutex);
-#endif
 
 	return 0;
 }
