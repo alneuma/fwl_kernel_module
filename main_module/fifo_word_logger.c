@@ -197,6 +197,7 @@ static size_t mem_used = 0;
  */
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
+static void fwl_transaction_log(const struct fwl_transaction_write *t, const char *label);
 
 static size_t fwl_word_size(const struct fwl_word *word)
 {
@@ -769,6 +770,8 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 
 	ret = fwl_transaction_populate_locked(&trans, ofd_data, buf, count,
 					      devbuf, buf_size);
+	fwl_transaction_log(&trans, "after populate");
+
 	kfree(devbuf);
 	if (ret)
 		goto done;
@@ -932,6 +935,14 @@ MODULE_DESCRIPTION("character device experiment using a list");
 /*
  * debugging functions
  */
+static void fwl_transaction_log(const struct fwl_transaction_write *t, const char *label)
+{
+	pr_debug("%s:\n", label);
+	
+	pr_debug("t->stash = %p\n", t->stash);
+	pr_debug("t->bytes_copied = %zu\n", t->bytes_copied);
+}
+
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 {
 	pr_debug("%s:\n", label);
