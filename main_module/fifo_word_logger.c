@@ -153,7 +153,7 @@
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
 #define FWL_LOG_INTERVAL HZ
-#define FWL_MAX_BUF 1024
+#define FWL_MAX_BUF 4
 
 struct fwl_word {
 	struct list_head node;
@@ -652,7 +652,7 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	stash = ofd_data->stash;
 	stash_owned = false;
 
-	while (copied_total < count) {
+	while (true) {
 
 		to_copy = min(buf_size, count - copied_total);
 		missing = copy_from_user(devbuf, buf + copied_total, to_copy);
@@ -680,7 +680,6 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 		trans.stash = NULL;
 		stash_owned = true;
 	}
-	kfree(devbuf);
 
 	mutex_lock(&fwl_mutex);
 	ret = fwl_transaction_commit_locked(&should_log, &trans, ofd_data,
@@ -689,6 +688,8 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 
 done:
 	mutex_unlock(&ofd_data->lock);
+
+	kfree(devbuf);
 	fwl_transaction_clear(&trans);
 	if (should_log)
 		fwl_start_logging();
