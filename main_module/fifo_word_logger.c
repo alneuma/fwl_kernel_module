@@ -564,7 +564,8 @@ static int fwl_transaction_update_counters(struct fwl_transaction_write *trans,
 	size_t bytes = 0;
 	u32 tmp_idx = next_node_idx;
 
-	if (check_add_overflow(bytes, fwl_word_size(trans->stash), &bytes))
+	if (trans->stash &&
+			check_add_overflow(bytes, fwl_word_size(trans->stash), &bytes))
 		return -EOVERFLOW;
 
 	if (bytes > FWL_MAX_MEM)
@@ -581,7 +582,7 @@ static int fwl_transaction_update_counters(struct fwl_transaction_write *trans,
 	if (bytes > FWL_MAX_MEM)
 		return -ENOSPC; /* consider letting this block */
 
-	if (check_sub_overflow(bytes, fwl_word_size(ofd_data->stash), &bytes))
+	if (ofd_data->stash && check_sub_overflow(bytes, fwl_word_size(ofd_data->stash), &bytes))
 		return -EOVERFLOW;
 
 	if (check_add_overflow(mem_used, bytes, &bytes))
@@ -625,9 +626,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 
 	*copied = trans->bytes_copied;
 
-	mutex_lock(&fwl_mutex);
 	pr_debug("mem_used: %zu\n", mem_used);
-	mutex_unlock(&fwl_mutex);
 
 	return 0;
 }
