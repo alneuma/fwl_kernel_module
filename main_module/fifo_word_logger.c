@@ -224,8 +224,9 @@ static bool fwl_consume_word(struct list_head *words)
 	list_del_init(&e->node);
 	mem_used -= fwl_word_size(e);
 
+#ifdef DEBUG
 	pr_debug("mem_used: %zu\n", mem_used);
-
+#endif
 	done = list_empty(&word_list);
 
 	mutex_unlock(&fwl_mutex);
@@ -438,8 +439,6 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 
 	(*new_word)->len = len;
 
-	pr_debug("leaving\n");
-
 	return 0;
 }
 
@@ -498,7 +497,6 @@ success:
 	trans->stash = new_word;
 	trans->bytes_copied += buf_size;
 failure:
-	pr_debug("leaving\n");
 	return ret;
 }
 
@@ -553,7 +551,6 @@ cleanup:
 	kfree(trans->stash);
 	fwl_word_list_clear(&trans->words);
 done:
-	pr_debug("leaving\n");
 	return ret;
 }
 
@@ -626,8 +623,9 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 
 	*copied = trans->bytes_copied;
 
+#ifdef DEBUG
 	pr_debug("mem_used: %zu\n", mem_used);
-
+#endif
 	return 0;
 }
 
@@ -706,9 +704,11 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 	kfree(filp->private_data);
 
+#ifdef DEBUG
 	mutex_lock(&fwl_mutex);
 	mem_used -= sizeof(struct fwl_ofd);
 	mutex_unlock(&fwl_mutex);
+#endif
 
 	return 0;
 }
@@ -769,7 +769,6 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 
 	ret = fwl_transaction_populate_locked(&trans, ofd_data, buf, count,
 					      devbuf, buf_size);
-	fwl_transaction_log(&trans, "after populate");
 
 	kfree(devbuf);
 	if (ret)
