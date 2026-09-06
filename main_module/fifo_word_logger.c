@@ -790,8 +790,6 @@ static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
 		++idx;
 	}
 
-	fwl_cursor_log(pos, "after update");
-
 	e = list_entry(pos->ptr, struct fwl_word, node);
 	if (pos->word_pos == e->len) {
 		if (list_is_last(pos->ptr, words))
