@@ -139,7 +139,7 @@
  *
  * lock ordering
  * 1. ofd local lock
- * 2. 
+ * 2. rw_sem_logging
  * 3. rw_sem_user
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
