@@ -874,6 +874,23 @@ done:
  * devbuf is used as a temporary buffer in which the memory is constructed
  * first.
  *
+ * We need to keep logging locked out during the call to copy_to_user(), to
+ * prevent the following scenario:
+ *
+ * 1. pos is pointing to an invalid node 
+ * 2. the first call to fwl_cursor_advance_locked() sets tmp_pos to the first
+ * valid node and starts counting bytes from there.
+ * 3. During the call to copy_to_user() logging happens and the first node gets
+ * removed.
+ * 4. copy_to_user() partially succeeds with a non zero return value
+ * 5. cursor_advance_locked() with second argument NULL gets called, to adjust
+ * pos to point to the correct node, but now the first valid node is different
+ * than in 2. so an equal number of bytes does now represent a different offset
+ * from the lists head. The curser becomes corrupted.
+ *
+ * On the other hand calls to write() extending the list during the call to
+ * copy_to_user() do not cause any trouble. Appending nodes, does not corrupt
+ * the cursor.
  */
 static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 				       size_t count, char *devbuf,
@@ -889,7 +906,6 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 	down_read(&rw_sem_user);
 
 	while (total_read < count) {
-		
 		bytes_read = fwl_cursor_advance_locked(&tmp_pos, devbuf,
 						       devbuf_size, &word_list);
 		if (!bytes_read)
