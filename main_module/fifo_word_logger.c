@@ -302,7 +302,7 @@ static void fwl_work_handler(struct work_struct *work)
  * contract
  * (1) Should only be called right after word_list switches from empty to
  * non-empty.
- * (2) Can not hold rw_sem_user while calling this
+ * (2) Can be called while holding rw_sem_user or rw_sem_logging.
  *
  * See "logging semantics and implementation" in the top most comment for a
  * discussion on concurrency.
