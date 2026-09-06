@@ -588,7 +588,7 @@ static int fwl_open(struct inode *inode, struct file *filp)
 {
 	struct fwl_ofd *ofd_data;
 	size_t mem_tmp = 0;
-	size_t ret = 0;
+	int ret = 0;
 
 	pr_debug("called\n");
 
