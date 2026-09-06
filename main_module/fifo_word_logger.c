@@ -362,8 +362,10 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 	if (!*new_word)
 		return -ENOMEM;
 
-	memcpy((*new_word)->word, prefix, prefix_len);
-	memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
+	if (prefix)
+		memcpy((*new_word)->word, prefix, prefix_len);
+	if (suffix)
+		memcpy((*new_word)->word + prefix_len, suffix, suffix_len);
 
 	(*new_word)->len = len;
 
