@@ -121,17 +121,15 @@
  *
  * *** Caveats ***
  *
- * - word length, list length are unbound
- * - read() buffers are dynamically allocated in the size of the buffers passed
- *   from userspace.
- * - Partial reads are not properly dealt with. Still partial reads can happen.
- *   The user must know, that in such cases the read cursor is not advanced.
+ * - word length and list length are unbound.
+ * - use of persistent memory is bound, but might not precisely represent the
+ *   actual persistent memory held, as kmalloc() can overallocate.
  *
  * Locks:
  *
  * ofd local lock
  * protects ofd local state from concurrent reads/writes
- * release() is excempt from this.
+ * release() is exempt from this.
  *
  * rw_sem
  * protects module wide shared state
