@@ -318,67 +318,6 @@ static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 }
 
 /*
- * fwl_read_from_pos()
- *
- * assumes words not empty
- *
- * A separator is "owned" by the word that comes before it. This means, that the
- * cursor does only advance to the next word, when the current word's trailing
- * separator is written. So the during regular reading
- *
- * pos->on_sep, is logically equivalent pos->word_pos.
- *
- * This rule is violated, when the cursor is advanced because of pointing
- * to a no longer existing word. In this situation we get
- *
- * pos->on_sep && pos->word_pos == 0.
- *
- */
-static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,
-				struct list_head *words)
-{
-	struct fwl_word *e;
-	size_t copy_size;
-	size_t idx = 0;
-
-	fwl_cursor_update(pos, words);
-
-	while (idx < count) {
-		if (pos->on_sep) {
-			if (pos->word_pos != 0 && list_is_last(pos->ptr, words))
-				goto done;
-			buf[idx++] = FWL_WORD_SEP;
-			pos->ptr = pos->ptr->next;
-			pos->word_pos = 0;
-			pos->on_sep = false;
-		} else if (pos->ptr == words)
-			pos->ptr = pos->ptr->next;
-
-		if (idx == count)
-			goto done;
-
-		e = list_entry(pos->ptr, struct fwl_word, node);
-
-		copy_size = min(e->len - pos->word_pos, count - idx);
-		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
-		pos->on_sep = false;
-		pos->word_pos += copy_size;
-		idx += copy_size;
-		if (idx == count)
-			goto done;
-
-		pos->on_sep = true;
-	}
-
-done:
-	e = list_entry(pos->ptr, struct fwl_word, node);
-	if (pos->word_pos == e->len)
-		pos->on_sep = true;
-	pos->node_idx = e->idx;
-	return idx;
-}
-
-/*
  * fwl_word_delim()
  *
  * c == FWL_WORD_SEP is separately checked, in case FWL_WORD_SEP is not
@@ -821,24 +760,115 @@ done:
 	return ret ? ret : copied;
 }
 
-static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf, size_t count, char *devbuf, size_t devbuf_size)
+/*
+ * fwl_cursor_advance()
+ *
+ * Advances pos, through the virtually continuous memory region constructed from
+ * words, by count bytes or less if the region ends earlier.
+ * When buf is not NULL, then the entirety of the traversed memory will be
+ * copied to buf.
+ *
+ * assumes words not empty
+ *
+ * A separator is "owned" by the word that comes before it. This means, that the
+ * cursor does only advance to the next word, when the current word's trailing
+ * separator is written. So the during regular reading
+ *
+ * pos->on_sep, is logically equivalent pos->word_pos.
+ *
+ * This rule is violated, when the cursor is advanced because of pointing
+ * to a no longer existing word. In this situation we get
+ *
+ * pos->on_sep && pos->word_pos == 0.
+ *
+ */
+static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf, size_t count, struct list_head *words)
 {
-	struct fwl_cursor tmp_pos;
+	struct fwl_word *e;
+	size_t copy_size;
+	size_t idx = 0;
 
-	bytes_read = fwl_read_from_pos(&pos, devbuf, devbuf_size, &word_list);
+	fwl_cursor_update(pos, words);
 
-	not_copied = copy_to_user(buf + total_read, devbuf, bytes_read);
-	if (not_copied) {
-		if (not_copied == bytes_read && !total_read) {
-			ret = -EFAULT;
-			goto failure;
-		}
-		total_read += bytes_read - not_copied;
-		goto success;
+	while (idx < count) {
+		if (pos->on_sep) {
+			if (pos->word_pos != 0 && list_is_last(pos->ptr, words))
+				goto done;
+			if (buf)
+				buf[idx] = FWL_WORD_SEP;
+			++idx;
+			pos->ptr = pos->ptr->next;
+			pos->word_pos = 0;
+			pos->on_sep = false;
+		} else if (pos->ptr == words)
+			pos->ptr = pos->ptr->next;
+
+		if (idx == count)
+			goto done;
+
+		e = list_entry(pos->ptr, struct fwl_word, node);
+
+		copy_size = min(e->len - pos->word_pos, count - idx);
+		if (buf)
+			memcpy(buf + idx, e->word + pos->word_pos, copy_size);
+		pos->on_sep = false;
+		pos->word_pos += copy_size;
+		idx += copy_size;
+		if (idx == count)
+			goto done;
+
+		pos->on_sep = true;
 	}
 
-	if (!ret)
-		ofd_data->pos = pos;
+done:
+	e = list_entry(pos->ptr, struct fwl_word, node);
+	if (pos->word_pos == e->len)
+		pos->on_sep = true;
+	pos->node_idx = e->idx;
+	return idx;
+}
+
+/*
+ * fwl_read_to_user()
+ * 
+ * Copies a maximum of count bytes from the virtually continuous memory region
+ * that is constructed from word_list.
+ * The start of the segment that is copied is indicated by pos.
+ * After returning pos is updated to point to the first byte not copied.
+ * devbuf is used as a temporary buffer in which the memory is constructed
+ * first.
+ *
+ */
+static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf,
+				size_t count, char *devbuf, size_t devbuf_size)
+{
+	struct fwl_cursor tmp_pos = *pos;
+	size_t not_copied;
+	size_t bytes_read;
+	size_t total_read = 0;
+	int ret = 0;
+
+	while (total_read < count) {
+
+		bytes_read = fwl_cursor_advance(&tmp_pos, devbuf, devbuf_size,
+					       &word_list);
+		if (!bytes_read)
+			break;
+
+		not_copied = copy_to_user(buf + total_read, devbuf, bytes_read);
+		total_read += bytes_read - not_copied;
+		if (!total_read) {
+			ret = -EFAULT;
+			break;
+		}
+		if (not_copied) {
+			fwl_cursor_advance(pos, NULL, bytes_read - not_copied, &word_list);
+			break;
+		}
+		*pos = tmp_pos;
+	}
+
+	return ret ? ret : total_read;
 }
 
 /*
@@ -891,60 +921,6 @@ done:
 	kfree(devbuf);
 zero_read:
 	return ret;
-}
-
-/*
- * fwl_read()
- *
- * Returns words joined with the single byte FWL_WORD_SEP.
- */
-static ssize_t fwl_read_old(struct file *filp, char __user *buf, size_t count,
-			loff_t *f_pos)
-{
-	struct fwl_cursor pos;
-	char *tmp_buf;
-	int ret = 0;
-	size_t total_read;
-	struct fwl_ofd *ofd_data = filp->private_data;
-
-	(void)f_pos;
-
-	pr_debug("called\n");
-
-	if (!count)
-		return 0;
-
-	tmp_buf = kmalloc(count, GFP_KERNEL);
-	if (!tmp_buf)
-		return -ENOMEM;
-
-	mutex_lock(&ofd_data->lock);
-
-	pos = ofd_data->pos;
-
-	mutex_lock(&rw_sem);
-
-	if (list_empty(&word_list)) {
-		mutex_unlock(&rw_sem);
-		mutex_unlock(&ofd_data->lock);
-		kfree(tmp_buf);
-		return 0;
-	}
-
-	total_read = fwl_read_from_pos(&pos, tmp_buf, count, &word_list);
-
-	mutex_unlock(&rw_sem);
-
-	if (copy_to_user(buf, tmp_buf, total_read))
-		ret = -EFAULT;
-
-	if (!ret)
-		ofd_data->pos = pos;
-
-	mutex_unlock(&ofd_data->lock);
-
-	kfree(tmp_buf);
-	return ret ? ret : total_read;
 }
 
 static const struct file_operations fwl_ops = {
