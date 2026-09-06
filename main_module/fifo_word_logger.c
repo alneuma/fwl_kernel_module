@@ -131,12 +131,17 @@
  * protects ofd local state from concurrent reads/writes
  * release() is exempt from this.
  *
+ * logging_lock
+ * prevents logging to happen during inopportune moments that are not covered by
+ * rw_sem
+ *
  * rw_sem
  * protects module wide shared state
  *
  * lock ordering
  * 1. ofd local lock
- * 2. rw_sem
+ * 2. 
+ * 3. rw_sem
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -187,6 +192,7 @@ struct fwl_transaction_write {
 };
 
 static DECLARE_RWSEM(rw_sem);
+static DEFINE_MUTEX(logging_lock);
 static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
@@ -218,11 +224,13 @@ static bool fwl_consume_first_word(struct list_head *words)
 	int len;
 	bool done;
 
+	mutex_lock(&logging_lock);
 	down_write(&rw_sem);
 
 	e = list_first_entry_or_null(words, struct fwl_word, node);
 	if (!e) {
 		up_write(&rw_sem);
+		mutex_unlock(&logging_lock);
 		return true;
 	}
 
@@ -234,6 +242,7 @@ static bool fwl_consume_first_word(struct list_head *words)
 	done = list_empty(&word_list);
 
 	up_write(&rw_sem);
+	mutex_unlock(&logging_lock);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
 	pr_info("%.*s\n", len, e->word);
@@ -777,8 +786,6 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
  * When buf is not NULL, then the entirety of the traversed memory will be
  * copied to buf.
  *
- * assumes words not empty
- *
  * A separator is "owned" by the word that comes before it. This means, that the
  * cursor does only advance to the next word, when the current word's trailing
  * separator is written.
@@ -790,6 +797,9 @@ static size_t fwl_cursor_advance_locked(struct fwl_cursor *pos, char *buf,
 	struct fwl_word *e;
 	size_t copy_size;
 	size_t idx = 0;
+
+	if (list_empty(words))
+		return 0;
 
 	if (fwl_cursor_update(pos, words)) {
 		if (buf)
@@ -853,12 +863,11 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 	size_t total_read = 0;
 	int ret = 0;
 
+	mutex_lock(&logging_lock);
 	down_read(&rw_sem);
 
-	if (list_empty(&word_list))
-		goto done;
-
 	while (total_read < count) {
+		
 		bytes_read = fwl_cursor_advance_locked(&tmp_pos, devbuf,
 						       devbuf_size, &word_list);
 		if (!bytes_read)
@@ -883,6 +892,7 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 
 done:
 	up_read(&rw_sem);
+	mutex_unlock(&logging_lock);
 	return ret ? ret : total_read;
 }
 
