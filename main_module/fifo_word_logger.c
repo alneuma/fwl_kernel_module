@@ -171,7 +171,6 @@ struct fwl_cursor {
 	struct list_head *ptr;
 	size_t word_pos;
 	u32 node_idx;
-	bool on_sep;
 };
 
 struct fwl_ofd {
@@ -296,23 +295,6 @@ static void fwl_start_logging(void)
 	(void)cancel_delayed_work_sync(&fwl_work);
 	fwl_next_log = jiffies + FWL_LOG_INTERVAL;
 	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
-}
-
-/*
- * fwl_cursor_update()
- * assumption: word not an empty list
- */
-static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
-{
-	struct fwl_word *e = list_first_entry(words, struct fwl_word, node);
-
-	if (!pos->ptr || pos->node_idx < e->idx) {
-		pos->on_sep = false;
-		if (pos->ptr && pos->word_pos != 0)
-			pos->on_sep = true;
-		pos->ptr = words;
-		pos->word_pos = 0;
-	}
 }
 
 /*
@@ -652,7 +634,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		if (!next_node_idx) {
 			mem_used -= sizeof(struct fwl_ofd);
-			mem_used -= sizeof(*stash);
+			mem_used -= fwl_word_size(stash);
 			up_write(&rw_sem);
 			kfree(stash);
 			kfree(filp->private_data);
@@ -759,6 +741,28 @@ done:
 }
 
 /*
+ * fwl_cursor_update()
+ * a started word was dropped -> true
+ * otherwise	   	      -> false
+ *
+ * assumption: word not an empty list
+ */
+static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
+{
+	struct fwl_word *e = list_first_entry(words, struct fwl_word, node);
+	bool dropped = false;
+
+	if (pos->node_idx < e->idx) {
+		if (pos->word_pos != 0)
+			dropped = true;
+		pos->ptr = &e->node;
+		pos->word_pos = 0;
+		pos->node_idx = e->idx;
+	}
+	return dropped;
+}
+
+/*
  * fwl_cursor_advance()
  *
  * Advances pos, through the virtually continuous memory region constructed from
@@ -787,42 +791,38 @@ static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
 	size_t copy_size;
 	size_t idx = 0;
 
-	fwl_cursor_update(pos, words);
+	if (fwl_cursor_update(pos, words)) {
+		if (buf)
+			buf[idx] = FWL_WORD_SEP;
+		++idx;
+	}
+
+	e = list_entry(pos->ptr, struct fwl_word, node);
+	if (pos->word_pos == e->len) {
+		if (list_is_last(pos->ptr, words))
+			goto done;
+		if (buf)
+			buf[idx] = FWL_WORD_SEP;
+		pos->ptr = pos->ptr->next;
+		pos->word_pos = 0;
+	}
 
 	while (idx < count) {
-		if (pos->on_sep) {
-			if (pos->word_pos != 0 && list_is_last(pos->ptr, words))
-				goto done;
-			if (buf)
-				buf[idx] = FWL_WORD_SEP;
-			++idx;
-			pos->ptr = pos->ptr->next;
-			pos->word_pos = 0;
-			pos->on_sep = false;
-		} else if (pos->ptr == words)
-			pos->ptr = pos->ptr->next;
-
-		if (idx == count)
-			goto done;
-
 		e = list_entry(pos->ptr, struct fwl_word, node);
-
 		copy_size = min(e->len - pos->word_pos, count - idx);
 		if (buf)
 			memcpy(buf + idx, e->word + pos->word_pos, copy_size);
-		pos->on_sep = false;
 		pos->word_pos += copy_size;
 		idx += copy_size;
-		if (idx == count)
+		if (idx == count || list_is_last(pos->ptr, words))
 			goto done;
-
-		pos->on_sep = true;
+		if (buf)
+			buf[idx] = FWL_WORD_SEP;
+		pos->ptr = pos->ptr->next;
+		pos->word_pos = 0;
 	}
 
 done:
-	e = list_entry(pos->ptr, struct fwl_word, node);
-	if (pos->word_pos == e->len)
-		pos->on_sep = true;
 	pos->node_idx = e->idx;
 	return idx;
 }
@@ -891,7 +891,7 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 	if (!count)
 		goto zero_read;
 
-	/* this is relatively cheap and can prevent unnecessary allocations */
+	/* this is cheap and can prevent unnecessary allocations */
 	down_read(&rw_sem);
 	empty_list = list_empty(&word_list);
 	up_read(&rw_sem);
@@ -1022,7 +1022,6 @@ static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 	pr_debug("ptr = %p\n", c->ptr);
 	pr_debug("word_pos = %zu\n", c->word_pos);
 	pr_debug("node_idx = %u\n", c->node_idx);
-	pr_debug("on_sep = %d\n", c->on_sep);
 }
 
 static void fwl_list_log(const struct list_head *l, const char *label)
