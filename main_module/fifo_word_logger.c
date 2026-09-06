@@ -807,7 +807,8 @@ static size_t fwl_cursor_advance_locked(struct fwl_cursor *pos, char *buf,
 	if (fwl_cursor_update(pos, words)) {
 		if (buf)
 			buf[idx] = FWL_WORD_SEP;
-		++idx;
+		if (++idx == count)
+			goto done;
 	}
 
 	e = list_entry(pos->ptr, struct fwl_word, node);
