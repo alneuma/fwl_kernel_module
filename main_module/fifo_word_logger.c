@@ -254,6 +254,13 @@ static bool fwl_consume_first_word(struct list_head *words)
 
 /*
  * fwl_schedule_work()
+ *
+ * In the exceptional case in which the current time is already past the ideal
+ * execution time of the next item, delay is set to 0.
+ *
+ * note:
+ * time_before() uses signed arithmetic for wraparound safety. This works within
+ * the limitations of the "half-range rule".
  */
 static void fwl_schedule_work(struct work_struct *work, unsigned long next_log)
 {
@@ -270,15 +277,7 @@ static void fwl_schedule_work(struct work_struct *work, unsigned long next_log)
 /* 
  * fwl_work_handler()
  *
- * To counteract timer drift the scheduling delay is calculated by subtracting
- * the current time from the ideal execution time of the next work item.
- *
- * In the exceptional case in which the current time is already past the ideal
- * execution time of the next item, the delay is instead set to 0.
- *
- * note:
- * time_before() uses signed arithmetic for wraparound safety. This works within
- * the limitations of the "half-range rule".
+ * To counteract timer drift next_log is set relative to the privious one.
  */
 static void fwl_work_handler(struct work_struct *work)
 {
