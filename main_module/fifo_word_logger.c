@@ -613,24 +613,36 @@ static int fwl_open(struct inode *inode, struct file *filp)
 
 	pr_debug("called\n");
 
+	/* This first check is cheap and can prevent unnecessary allocation. */
+	down_read(&rw_sem_user);
+	mem_tmp = mem_used;
+	up_read(&rw_sem_user);
+
+	if (check_add_overflow(mem_tmp, sizeof(struct fwl_ofd), &mem_tmp))
+		return -EOVERFLOW;
+	else if (mem_tmp > FWL_MAX_MEM)
+		return -ENOSPC;
+
 	ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
 		return -ENOMEM;
 
 	mutex_init(&ofd_data->lock);
-	filp->private_data = ofd_data;
 
 	down_write(&rw_sem_user);
+
 	if (check_add_overflow(mem_used, sizeof(*ofd_data), &mem_tmp))
 		ret = -EOVERFLOW;
 	else if (mem_tmp > FWL_MAX_MEM)
 		ret = -ENOSPC;
-	else
-		mem_used = mem_tmp;
+
 	up_write(&rw_sem_user);
 
-	if (ret)
-		kfree(filp->private_data);
+	if (!ret) {
+		mem_used = mem_tmp;
+		filp->private_data = ofd_data;
+	} else
+		kfree(ofd_data);
 
 	return ret;
 }
