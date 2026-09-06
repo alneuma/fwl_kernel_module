@@ -11,8 +11,7 @@
  *
  * Splits content of the buffer into words and appends these words to the queue.
  * A word is any sequence of bytes that is surrounded by separators.
- * A separator is any byte, that is FWL_WORD_SEP, the zero byte or any byte
- * for which isspace() returns true.
+ * A separator is any byte, that is FWL_WORD_SEP, the zero byte or any byte for which isspace() returns true.
  * The first byte of the first call to write() from a newly created ofd (open
  * file description) is considered to be to the right of a separator.
  * Similarly the last byte written before an ofd is released is considered to be
@@ -145,19 +144,23 @@
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
-#include <linux/module.h>
-#include <linux/fs.h>
-#include <linux/printk.h>
-#include <linux/init.h>
 #include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/slab.h>
-#include <linux/list.h>
 #include <linux/ctype.h>
-#include <linux/mutex.h>
+#include <linux/device.h>
 #include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/list.h>
+#include <linux/jiffies.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/printk.h>
+#include <linux/rwsem.h>
+#include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
+
 
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
