@@ -121,24 +121,22 @@
  *
  * *** Caveats ***
  *
- * - word length, list length are unbound
- * - read() buffers are dynamically allocated in the size of the buffers passed
- *   from userspace.
- * - Partial reads are not properly dealt with. Still partial reads can happen.
- *   The user must know, that in such cases the read cursor is not advanced.
+ * - word length and list length are unbound.
+ * - use of persistent memory is bound, but might not precisely represent the
+ *   actual persistent memory held, as kmalloc() can overallocate.
  *
  * Locks:
  *
  * ofd local lock
  * protects ofd local state from concurrent reads/writes
- * release() is excempt from this.
+ * release() is exempt from this.
  *
- * fwl_mutex
+ * rw_sem
  * protects module wide shared state
  *
  * lock ordering
  * 1. ofd local lock
- * 2. fwl_mutex
+ * 2. rw_sem
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -160,7 +158,7 @@
 #define FWL_WORD_SEP ' '
 #define FWL_LOG_INTERVAL HZ
 #define FWL_MAX_BUF 1024
-#define FWL_MAX_MEM 4096
+#define FWL_MAX_MEM (1024 * 1024)
 
 struct fwl_word {
 	struct list_head node;
@@ -173,7 +171,6 @@ struct fwl_cursor {
 	struct list_head *ptr;
 	size_t word_pos;
 	u32 node_idx;
-	bool on_sep;
 };
 
 struct fwl_ofd {
@@ -189,7 +186,7 @@ struct fwl_transaction_write {
 	size_t bytes_copied;
 };
 
-static DEFINE_MUTEX(fwl_mutex);
+static DECLARE_RWSEM(rw_sem);
 static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
@@ -221,11 +218,11 @@ static bool fwl_consume_first_word(struct list_head *words)
 	int len;
 	bool done;
 
-	mutex_lock(&fwl_mutex);
+	down_write(&rw_sem);
 
 	e = list_first_entry_or_null(words, struct fwl_word, node);
 	if (!e) {
-		mutex_unlock(&fwl_mutex);
+		up_write(&rw_sem);
 		return true;
 	}
 
@@ -236,7 +233,7 @@ static bool fwl_consume_first_word(struct list_head *words)
 
 	done = list_empty(&word_list);
 
-	mutex_unlock(&fwl_mutex);
+	up_write(&rw_sem);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
 	pr_info("%.*s\n", len, e->word);
@@ -288,7 +285,7 @@ static void fwl_work_handler(struct work_struct *work)
  * contract
  * (1) Should only be called right after word_list switches from empty to
  * non-empty.
- * (2) Can not hold fwl_mutex while calling this
+ * (2) Can not hold rw_sem while calling this
  *
  * See "logging semantics and implementation" in the top most comment for a
  * discussion on concurrency.
@@ -298,84 +295,6 @@ static void fwl_start_logging(void)
 	(void)cancel_delayed_work_sync(&fwl_work);
 	fwl_next_log = jiffies + FWL_LOG_INTERVAL;
 	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
-}
-
-/*
- * fwl_cursor_update()
- * assumption: word not an empty list
- */
-static void fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
-{
-	struct fwl_word *e = list_first_entry(words, struct fwl_word, node);
-
-	if (!pos->ptr || pos->node_idx < e->idx) {
-		pos->on_sep = false;
-		if (pos->ptr && pos->word_pos != 0)
-			pos->on_sep = true;
-		pos->ptr = words;
-		pos->word_pos = 0;
-	}
-}
-
-/*
- * fwl_read_from_pos()
- *
- * assumes words not empty
- *
- * A separator is "owned" by the word that comes before it. This means, that the
- * cursor does only advance to the next word, when the current word's trailing
- * separator is written. So the during regular reading
- *
- * pos->on_sep, is logically equivalent pos->word_pos.
- *
- * This rule is violated, when the cursor is advanced because of pointing
- * to a no longer existing word. In this situation we get
- *
- * pos->on_sep && pos->word_pos == 0.
- *
- */
-static size_t fwl_read_from_pos(struct fwl_cursor *pos, char *buf, size_t count,
-				struct list_head *words)
-{
-	struct fwl_word *e;
-	size_t copy_size;
-	size_t idx = 0;
-
-	fwl_cursor_update(pos, words);
-
-	while (idx < count) {
-		if (pos->on_sep) {
-			if (pos->word_pos != 0 && list_is_last(pos->ptr, words))
-				goto done;
-			buf[idx++] = FWL_WORD_SEP;
-			pos->ptr = pos->ptr->next;
-			pos->word_pos = 0;
-			pos->on_sep = false;
-		} else if (pos->ptr == words)
-			pos->ptr = pos->ptr->next;
-
-		if (idx == count)
-			goto done;
-
-		e = list_entry(pos->ptr, struct fwl_word, node);
-
-		copy_size = min(e->len - pos->word_pos, count - idx);
-		memcpy(buf + idx, e->word + pos->word_pos, copy_size);
-		pos->on_sep = false;
-		pos->word_pos += copy_size;
-		idx += copy_size;
-		if (idx == count)
-			goto done;
-
-		pos->on_sep = true;
-	}
-
-done:
-	e = list_entry(pos->ptr, struct fwl_word, node);
-	if (pos->word_pos == e->len)
-		pos->on_sep = true;
-	pos->node_idx = e->idx;
-	return idx;
 }
 
 /*
@@ -680,14 +599,14 @@ static int fwl_open(struct inode *inode, struct file *filp)
 	mutex_init(&ofd_data->lock);
 	filp->private_data = ofd_data;
 
-	mutex_lock(&fwl_mutex);
+	down_write(&rw_sem);
 	if (check_add_overflow(mem_used, sizeof(*ofd_data), &mem_tmp))
 		ret = -EOVERFLOW;
 	else if (mem_tmp > FWL_MAX_MEM)
 		ret = -ENOSPC;
 	else
 		mem_used = mem_tmp;
-	mutex_unlock(&fwl_mutex);
+	up_write(&rw_sem);
 
 	if (ret)
 		kfree(filp->private_data);
@@ -711,12 +630,12 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	pr_debug("called\n");
 
 	if (stash) {
-		mutex_lock(&fwl_mutex);
+		down_write(&rw_sem);
 
 		if (!next_node_idx) {
 			mem_used -= sizeof(struct fwl_ofd);
-			mem_used -= sizeof(*stash);
-			mutex_unlock(&fwl_mutex);
+			mem_used -= fwl_word_size(stash);
+			up_write(&rw_sem);
 			kfree(stash);
 			kfree(filp->private_data);
 			return -ENOSPC;
@@ -727,16 +646,16 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		list_add_tail(&stash->node, &word_list);
 
-		mutex_unlock(&fwl_mutex);
+		up_write(&rw_sem);
 		if (should_log)
 			fwl_start_logging();
 	}
 
 	kfree(filp->private_data);
 
-	mutex_lock(&fwl_mutex);
+	down_write(&rw_sem);
 	mem_used -= sizeof(struct fwl_ofd);
-	mutex_unlock(&fwl_mutex);
+	up_write(&rw_sem);
 
 	return 0;
 }
@@ -802,12 +721,11 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	if (ret)
 		goto done;
 
-	mutex_lock(&fwl_mutex);
-
+	down_write(&rw_sem);
 	ret = fwl_transaction_commit_locked(&trans, ofd_data, &word_list,
 					    &should_log, &copied);
+	up_write(&rw_sem);
 
-	mutex_unlock(&fwl_mutex);
 done:
 	mutex_unlock(&ofd_data->lock);
 
@@ -823,6 +741,132 @@ done:
 }
 
 /*
+ * fwl_cursor_update()
+ * a started word was dropped -> true
+ * otherwise	   	      -> false
+ *
+ * assumption: word not an empty list
+ */
+static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
+{
+	struct fwl_word *e = list_first_entry(words, struct fwl_word, node);
+	bool dropped = false;
+
+	if (pos->node_idx < e->idx) {
+		if (pos->word_pos != 0)
+			dropped = true;
+		pos->ptr = &e->node;
+		pos->word_pos = 0;
+		pos->node_idx = e->idx;
+	}
+	return dropped;
+}
+
+/*
+ * fwl_cursor_advance()
+ *
+ * Advances pos, through the virtually continuous memory region constructed from
+ * words, by count bytes or less if the region ends earlier.
+ * When buf is not NULL, then the entirety of the traversed memory will be
+ * copied to buf.
+ *
+ * assumes words not empty
+ *
+ * A separator is "owned" by the word that comes before it. This means, that the
+ * cursor does only advance to the next word, when the current word's trailing
+ * separator is written.
+ *
+ */
+static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
+				 size_t count, struct list_head *words)
+{
+	struct fwl_word *e;
+	size_t copy_size;
+	size_t idx = 0;
+
+	if (fwl_cursor_update(pos, words)) {
+		if (buf)
+			buf[idx] = FWL_WORD_SEP;
+		++idx;
+	}
+
+	e = list_entry(pos->ptr, struct fwl_word, node);
+	if (pos->word_pos == e->len) {
+		if (list_is_last(pos->ptr, words))
+			goto done;
+		if (buf)
+			buf[idx] = FWL_WORD_SEP;
+		++idx;
+		pos->ptr = pos->ptr->next;
+		pos->word_pos = 0;
+	}
+
+	while (idx < count) {
+		e = list_entry(pos->ptr, struct fwl_word, node);
+		copy_size = min(e->len - pos->word_pos, count - idx);
+		if (buf)
+			memcpy(buf + idx, e->word + pos->word_pos, copy_size);
+		pos->word_pos += copy_size;
+		idx += copy_size;
+		if (idx == count || list_is_last(pos->ptr, words))
+			goto done;
+		if (buf)
+			buf[idx] = FWL_WORD_SEP;
+		++idx;
+		pos->ptr = pos->ptr->next;
+		pos->word_pos = 0;
+	}
+
+done:
+	e = list_entry(pos->ptr, struct fwl_word, node);
+	pos->node_idx = e->idx;
+	return idx;
+}
+
+/*
+ * fwl_read_to_user()
+ * 
+ * Copies a maximum of count bytes from the virtually continuous memory region
+ * that is constructed from word_list.
+ * The start of the segment that is copied is indicated by pos.
+ * After returning pos is updated to point to the first byte not copied.
+ * devbuf is used as a temporary buffer in which the memory is constructed
+ * first.
+ *
+ */
+static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf,
+				size_t count, char *devbuf, size_t devbuf_size)
+{
+	struct fwl_cursor tmp_pos = *pos;
+	size_t not_copied;
+	size_t bytes_read;
+	size_t total_read = 0;
+	int ret = 0;
+
+	while (total_read < count) {
+		bytes_read = fwl_cursor_advance(&tmp_pos, devbuf, devbuf_size,
+						&word_list);
+		if (!bytes_read)
+			break;
+
+		not_copied = copy_to_user(buf + total_read, devbuf, bytes_read);
+		total_read += bytes_read - not_copied;
+		if (!total_read) {
+			ret = -EFAULT;
+			break;
+		}
+		if (not_copied) {
+			fwl_cursor_advance(pos, NULL, bytes_read - not_copied,
+					   &word_list);
+			break;
+		}
+		*pos = tmp_pos;
+	}
+
+	return ret ? ret : total_read;
+}
+
+/*
  * fwl_read()
  *
  * Returns words joined with the single byte FWL_WORD_SEP.
@@ -830,50 +874,48 @@ done:
 static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 			loff_t *f_pos)
 {
-	struct fwl_cursor pos;
-	char *tmp_buf;
-	int ret = 0;
-	size_t total_read;
+	char *devbuf = NULL;
 	struct fwl_ofd *ofd_data = filp->private_data;
+	size_t devbuf_size;
+	bool empty_list = false;
+	ssize_t ret = 0;
 
 	(void)f_pos;
 
 	pr_debug("called\n");
 
 	if (!count)
-		return 0;
+		goto zero_read;
 
-	tmp_buf = kmalloc(count, GFP_KERNEL);
-	if (!tmp_buf)
-		return -ENOMEM;
+	/* this is cheap and can prevent unnecessary allocations */
+	down_read(&rw_sem);
+	empty_list = list_empty(&word_list);
+	up_read(&rw_sem);
 
-	mutex_lock(&ofd_data->lock);
+	if (empty_list)
+		goto zero_read;
 
-	pos = ofd_data->pos;
-
-	mutex_lock(&fwl_mutex);
-
-	if (list_empty(&word_list)) {
-		mutex_unlock(&fwl_mutex);
-		mutex_unlock(&ofd_data->lock);
-		kfree(tmp_buf);
-		return 0;
+	devbuf_size = min(count, FWL_MAX_BUF);
+	devbuf = kmalloc(devbuf_size, GFP_KERNEL);
+	if (!devbuf) {
+		ret = -ENOMEM;
+		goto zero_read;
 	}
 
-	total_read = fwl_read_from_pos(&pos, tmp_buf, count, &word_list);
+	mutex_lock(&ofd_data->lock);
+	down_read(&rw_sem);
 
-	mutex_unlock(&fwl_mutex);
+	if (list_empty(&word_list))
+		goto done;
 
-	if (copy_to_user(buf, tmp_buf, total_read))
-		ret = -EFAULT;
+	ret = fwl_read_to_user(&ofd_data->pos, buf, count, devbuf, devbuf_size);
 
-	if (!ret)
-		ofd_data->pos = pos;
-
+done:
+	up_read(&rw_sem);
 	mutex_unlock(&ofd_data->lock);
-
-	kfree(tmp_buf);
-	return ret ? ret : total_read;
+	kfree(devbuf);
+zero_read:
+	return ret;
 }
 
 static const struct file_operations fwl_ops = {
@@ -976,7 +1018,6 @@ static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 	pr_debug("ptr = %p\n", c->ptr);
 	pr_debug("word_pos = %zu\n", c->word_pos);
 	pr_debug("node_idx = %u\n", c->node_idx);
-	pr_debug("on_sep = %d\n", c->on_sep);
 }
 
 static void fwl_list_log(const struct list_head *l, const char *label)
