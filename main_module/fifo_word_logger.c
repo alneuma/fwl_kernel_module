@@ -310,16 +310,20 @@ static bool fwl_word_delim(char c)
 
 /*
  * fwl_word_list_clear()
+ * returns amount of reclaimed dynamically allocated memory
  */
-static void fwl_word_list_clear(struct list_head *list)
+static size_t fwl_word_list_clear(struct list_head *list)
 {
 	struct fwl_word *e;
 	struct fwl_word *n;
+	size_t mem = 0;
 
 	list_for_each_entry_safe(e, n, list, node) {
+		mem += fwl_word_size(e);
 		list_del(&e->node);
 		kfree(e);
 	}
+	return mem;
 }
 
 /*
@@ -476,7 +480,7 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 
 cleanup:
 	kfree(trans->stash);
-	fwl_word_list_clear(&trans->words);
+	(void)fwl_word_list_clear(&trans->words);
 done:
 	return ret;
 }
@@ -575,7 +579,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 static void fwl_transaction_clear(struct fwl_transaction_write *trans)
 {
 	kfree(trans->stash);
-	fwl_word_list_clear(&trans->words);
+	(void)fwl_word_list_clear(&trans->words);
 }
 
 /*
@@ -988,7 +992,8 @@ static void __exit fwl_exit(void)
 	class_destroy(cls);
 	cdev_del(&fifo_word_logger);
 	unregister_chrdev_region(devt, 1);
-	fwl_word_list_clear(&word_list);
+	mem_used -= fwl_word_list_clear(&word_list);
+	BUG_ON(mem_used);
 
 	pr_info("%s removed successfully\n", FWL_DRIVER_NAME);
 }
