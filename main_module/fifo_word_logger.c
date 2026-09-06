@@ -158,7 +158,7 @@
 #define FWL_WORD_SEP ' '
 #define FWL_LOG_INTERVAL HZ
 #define FWL_MAX_BUF 1024
-#define FWL_MAX_MEM 4096
+#define FWL_MAX_MEM (1024 * 1024)
 
 struct fwl_word {
 	struct list_head node;
@@ -780,7 +780,8 @@ done:
  * pos->on_sep && pos->word_pos == 0.
  *
  */
-static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf, size_t count, struct list_head *words)
+static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
+				 size_t count, struct list_head *words)
 {
 	struct fwl_word *e;
 	size_t copy_size;
@@ -847,9 +848,8 @@ static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf,
 	int ret = 0;
 
 	while (total_read < count) {
-
 		bytes_read = fwl_cursor_advance(&tmp_pos, devbuf, devbuf_size,
-					       &word_list);
+						&word_list);
 		if (!bytes_read)
 			break;
 
@@ -860,7 +860,8 @@ static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf,
 			break;
 		}
 		if (not_copied) {
-			fwl_cursor_advance(pos, NULL, bytes_read - not_copied, &word_list);
+			fwl_cursor_advance(pos, NULL, bytes_read - not_copied,
+					   &word_list);
 			break;
 		}
 		*pos = tmp_pos;
