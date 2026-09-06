@@ -131,17 +131,16 @@
  * protects ofd local state from concurrent reads/writes
  * release() is exempt from this.
  *
- * logging_lock
- * prevents logging to happen during inopportune moments that are not covered by
- * rw_sem
+ * rw_sem_logging
+ * protects shared state access from logging during specific inopportune moments
  *
- * rw_sem
+ * rw_sem_user
  * protects module wide shared state
  *
  * lock ordering
  * 1. ofd local lock
  * 2. 
- * 3. rw_sem
+ * 3. rw_sem_user
  */
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
 
@@ -191,8 +190,8 @@ struct fwl_transaction_write {
 	size_t bytes_copied;
 };
 
-static DECLARE_RWSEM(rw_sem);
-static DEFINE_MUTEX(logging_lock);
+static DECLARE_RWSEM(rw_sem_user);
+static DECLARE_RWSEM(rw_sem_logging);
 static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
@@ -224,13 +223,13 @@ static bool fwl_consume_first_word(struct list_head *words)
 	int len;
 	bool done;
 
-	mutex_lock(&logging_lock);
-	down_write(&rw_sem);
+	down_write(&rw_sem_logging);
+	down_write(&rw_sem_user);
 
 	e = list_first_entry_or_null(words, struct fwl_word, node);
 	if (!e) {
-		up_write(&rw_sem);
-		mutex_unlock(&logging_lock);
+		up_write(&rw_sem_user);
+		up_write(&rw_sem_logging);
 		return true;
 	}
 
@@ -241,8 +240,8 @@ static bool fwl_consume_first_word(struct list_head *words)
 
 	done = list_empty(&word_list);
 
-	up_write(&rw_sem);
-	mutex_unlock(&logging_lock);
+	up_write(&rw_sem_user);
+	up_write(&rw_sem_logging);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
 	pr_info("%.*s\n", len, e->word);
@@ -294,7 +293,7 @@ static void fwl_work_handler(struct work_struct *work)
  * contract
  * (1) Should only be called right after word_list switches from empty to
  * non-empty.
- * (2) Can not hold rw_sem while calling this
+ * (2) Can not hold rw_sem_user while calling this
  *
  * See "logging semantics and implementation" in the top most comment for a
  * discussion on concurrency.
@@ -613,14 +612,14 @@ static int fwl_open(struct inode *inode, struct file *filp)
 	mutex_init(&ofd_data->lock);
 	filp->private_data = ofd_data;
 
-	down_write(&rw_sem);
+	down_write(&rw_sem_user);
 	if (check_add_overflow(mem_used, sizeof(*ofd_data), &mem_tmp))
 		ret = -EOVERFLOW;
 	else if (mem_tmp > FWL_MAX_MEM)
 		ret = -ENOSPC;
 	else
 		mem_used = mem_tmp;
-	up_write(&rw_sem);
+	up_write(&rw_sem_user);
 
 	if (ret)
 		kfree(filp->private_data);
@@ -644,12 +643,12 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	pr_debug("called\n");
 
 	if (stash) {
-		down_write(&rw_sem);
+		down_write(&rw_sem_user);
 
 		if (!next_node_idx) {
 			mem_used -= sizeof(struct fwl_ofd);
 			mem_used -= fwl_word_size(stash);
-			up_write(&rw_sem);
+			up_write(&rw_sem_user);
 			kfree(stash);
 			kfree(filp->private_data);
 			return -ENOSPC;
@@ -660,16 +659,16 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		list_add_tail(&stash->node, &word_list);
 
-		up_write(&rw_sem);
+		up_write(&rw_sem_user);
 		if (should_log)
 			fwl_start_logging();
 	}
 
 	kfree(filp->private_data);
 
-	down_write(&rw_sem);
+	down_write(&rw_sem_user);
 	mem_used -= sizeof(struct fwl_ofd);
-	up_write(&rw_sem);
+	up_write(&rw_sem_user);
 
 	return 0;
 }
@@ -735,10 +734,10 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	if (ret)
 		goto done;
 
-	down_write(&rw_sem);
+	down_write(&rw_sem_user);
 	ret = fwl_transaction_commit_locked(&trans, ofd_data, &word_list,
 					    &should_log, &copied);
-	up_write(&rw_sem);
+	up_write(&rw_sem_user);
 
 done:
 	mutex_unlock(&ofd_data->lock);
@@ -779,7 +778,7 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 /*
  * fwl_cursor_advance_locked()
  *
- * must hold rw_sem for reading
+ * must hold rw_sem_user for reading
  *
  * Advances pos, through the virtually continuous memory region constructed from
  * words, by count bytes or less if the region ends earlier.
@@ -863,8 +862,8 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 	size_t total_read = 0;
 	int ret = 0;
 
-	mutex_lock(&logging_lock);
-	down_read(&rw_sem);
+	down_read(&rw_sem_logging);
+	down_read(&rw_sem_user);
 
 	while (total_read < count) {
 		
@@ -873,9 +872,9 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 		if (!bytes_read)
 			goto done;
 
-		up_read(&rw_sem);
+		up_read(&rw_sem_user);
 		not_copied = copy_to_user(buf + total_read, devbuf, bytes_read);
-		down_read(&rw_sem);
+		down_read(&rw_sem_user);
 
 		total_read += bytes_read - not_copied;
 		if (!total_read) {
@@ -891,8 +890,8 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 	}
 
 done:
-	up_read(&rw_sem);
-	mutex_unlock(&logging_lock);
+	up_read(&rw_sem_user);
+	up_read(&rw_sem_logging);
 	return ret ? ret : total_read;
 }
 
@@ -918,9 +917,9 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 		return 0;
 
 	/* this is relatively cheap and can prevent unnecessary allocations */
-	down_read(&rw_sem);
+	down_read(&rw_sem_user);
 	empty_list = list_empty(&word_list);
-	up_read(&rw_sem);
+	up_read(&rw_sem_user);
 
 	if (empty_list)
 		return 0;
