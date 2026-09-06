@@ -612,10 +612,11 @@ static int fwl_open(struct inode *inode, struct file *filp)
 		ret = -EOVERFLOW;
 	else if (mem_tmp > FWL_MAX_MEM)
 		ret = -ENOSPC;
+	else
+		mem_used = mem_tmp;
 	up_write(&rw_sem_user);
 
 	if (!ret) {
-		mem_used = mem_tmp;
 		mutex_init(&ofd_data->lock);
 		filp->private_data = ofd_data;
 	} else
