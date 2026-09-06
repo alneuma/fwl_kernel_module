@@ -63,18 +63,17 @@
  * *** memory limits ***
  * 
  * There is a maximum number of bytes that is allowed to be occupied by the
- * persistent device state. Object counted are:
+ * persistent device state. Objects counted are:
  * - nodes of the queue
  * - per ofd private data
  *
  * *** logging semantics and implementation ***
  * 
  * A new logging sequence starts when the state of the queue switches from empty 
- * to non-empty. The first logging event of a new sequence happens one second
- * after the sequence started. During each logging event the first word in the
- * queue will be removed from the queue and logged. If it was the last word in
- * the queue the logging sequence stops. A logging sequence is implemented by a
- * self rescheduling delayed word item.
+ * to non-empty. The first logging event is scheduled to happen one second after
+ * this. The work item's callback function does then establish the next_log
+ * variable which always represents the ideal next log time. This variable is
+ * used to counteract timer drift from the moment on the first callback happens.
  *
  * Thoughts about concurrency:
  * So the two relevant events for controlling the logging are associated with
@@ -83,38 +82,33 @@
  * (1) empty -> non-empty causes logging to start
  * (2) non-empty -> empty causes logging to stop
  *
- * Questions of concurrency are simplified by the following:
- * - Event (1) is entirely controlled by the fwl_write() and fwl_release(). If
- *   any of them causes (1) it will start a logging sequence
- * - Event (2) is entirely controlled by fwl_work_handler(), the callback
- *   function of the work item, which will not self reschedule if it causes (2)
- *   and thus stop the logging sequence.
+ * - Event (1) is entirely controlled by fwl_write() and fwl_release().
+ * - Event (2) is entirely controlled by the callback, fwl_work_handler().
  * - Each of those events is locked to happen atomically.
+ * - When fwl_write() causes (1) it will schedule a work item.
+ * - When fwl_release() causes (1) it will schedule a work item.
+ * - When fwl_work_handler() causes (2) it will not reschedule itself
  *
  * This gives the following guarantees:
+ *
  * (a) When the queue is empty there is either no work item scheduled or the
- *     callback has reached a stage in which it can no longer cause event (1)
- *     and has already determined that it will not reschedule.
- * (b) When the queue is non-empty no thread is in a stage where it can attempt
- *     to start logging.
- * (c) Because of (a), (1) can only happen in a context in which no work item
- *     that could cause (2) is scheduled.
- * (d) Because of (b) fwl_work_handler() can only reschedule itself in a context 
- *     in which no thread could attempt to start logging.
- * (e) Because of the atomicity of (1) it is impossible that multiple threads
- *     are contesting for starting logging: When one thread exits the critical
- *     section during which it caused (1), the queue's state has already changed
- *     to non-empty. So no other thread will be contesting for starting the
- *     logging sequence.
+ *     callback is currently executing, has caused (2) and has already
+ *     determined that it will not reschedule itself.
  *
- * One imaginative edge cases:
+ * (b) When the queue is non-empty and (1) did not happen recently, the self
+ *     rescheduling logging mechanism is running and neither fwl_write() nor
+ *     fwl_release() are trying to schedule work items.
  *
- * 1. Thread A causes (1) then leaves the critical section.
- * 2. A work item that was still pending causes (2).
- * 3. Thread B causes (1)
- * 4. Thread A and Thread B are contenting for starting logging.
- *
- * But (c) rules out 2., so this can never happen.
+ * (c) When (1) happened recently, i.e. the function that caused it is
+ *     still executing but has not yet scheduled a new work item, then no work
+ *     item is scheduled yet and no other thread is bound to schedule one. This
+ *     holds because (1) happened atomically, so for the callback the conditions
+ *     under (a) still hold. Likewise, also because of the atomicity, no other
+ *     fwl_write()/fwl_release() thread can have caused (1) and as such no other
+ *     fwl_write()/fwl_release() thread will attempt scheduling.
+ * 
+ * All of this guarantees that the control of starting/stopping a periodic
+ * logging sequence will happen uncontested.
  *
  * *** Caveats ***
  *
@@ -281,7 +275,7 @@ static void fwl_schedule_work(struct work_struct *work, unsigned long next_log)
 /* 
  * fwl_work_handler()
  *
- * To counteract timer drift next_log is set relative to the privious one.
+ * To counteract timer drift next_log is set relative to the previous one.
  */
 static void fwl_work_handler(struct work_struct *work)
 {
@@ -298,26 +292,6 @@ static void fwl_work_handler(struct work_struct *work)
 		fwl_schedule_work(work, next_log);
 	else
 		next_log_set = false;
-}
-
-/*
- * fwl_start_logging()
- *
- * contract
- * (1) Should only be called right after word_list switches from empty to
- * non-empty.
- * (2) Can be called while holding rw_sem_user or rw_sem_logging.
- *
- * See "logging semantics and implementation" in the top most comment for a
- * discussion on concurrency.
- */
-static void fwl_start_logging(void)
-{
-	lockdep_assert_not_held(&rw_sem_logging);
-	lockdep_assert_not_held(&rw_sem_user);
-
-	(void)cancel_delayed_work_sync(&fwl_work);
-	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 }
 
 /*
@@ -699,7 +673,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		up_write(&rw_sem_user);
 		if (should_log)
-			fwl_start_logging();
+			(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 	}
 
 	kfree(filp->private_data);
@@ -714,7 +688,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
 /*
  * fwl_write()
  *
- * To prevent an edgecases that would introduce unintuitive word ordering,
+ * To prevent an edge cases that would introduce unintuitive word ordering,
  * ofd_data->lock is only released after the new list segment is commited to the
  * shared list.
  *
@@ -786,7 +760,7 @@ done:
 		fwl_transaction_clear(&trans);
 
 	if (should_log)
-		fwl_start_logging();
+		(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 
 	return ret ? ret : copied;
 }
@@ -904,7 +878,7 @@ done:
  * 5. cursor_advance_locked() with second argument NULL gets called, to adjust
  * pos to point to the correct node, but now the first valid node is different
  * than in 2. so an equal number of bytes does now represent a different offset
- * from the lists head. The curser becomes corrupted.
+ * from the lists head. The cursor becomes corrupted.
  *
  * On the other hand calls to write() extending the list during the call to
  * copy_to_user() do not cause any trouble. Appending nodes, does not corrupt
