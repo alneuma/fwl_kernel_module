@@ -508,7 +508,7 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 	u32 tmp_idx = next_node_idx;
 
 	if (trans->stash)
-	    new_mem_used = fwl_word_size(trans->stash);
+		new_mem_used = fwl_word_size(trans->stash);
 
 	list_for_each_entry(e, &trans->words, node) {
 		if (!tmp_idx)
@@ -768,7 +768,9 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 }
 
 /*
- * fwl_cursor_advance()
+ * fwl_cursor_advance_locked()
+ *
+ * must hold rw_sem for reading
  *
  * Advances pos, through the virtually continuous memory region constructed from
  * words, by count bytes or less if the region ends earlier.
@@ -782,8 +784,8 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
  * separator is written.
  *
  */
-static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
-				 size_t count, struct list_head *words)
+static size_t fwl_cursor_advance_locked(struct fwl_cursor *pos, char *buf,
+					size_t count, struct list_head *words)
 {
 	struct fwl_word *e;
 	size_t copy_size;
@@ -829,7 +831,9 @@ done:
 }
 
 /*
- * fwl_read_to_user()
+ * fwl_read_to_user_locked()
+ *
+ * must hold ofd_data->lock
  * 
  * Copies a maximum of count bytes from the virtually continuous memory region
  * that is constructed from word_list.
@@ -839,8 +843,9 @@ done:
  * first.
  *
  */
-static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf,
-				size_t count, char *devbuf, size_t devbuf_size)
+static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
+				       size_t count, char *devbuf,
+				       size_t devbuf_size)
 {
 	struct fwl_cursor tmp_pos = *pos;
 	size_t not_copied;
@@ -848,26 +853,36 @@ static ssize_t fwl_read_to_user(struct fwl_cursor *pos, char __user *buf,
 	size_t total_read = 0;
 	int ret = 0;
 
-	while (total_read < count) {
-		bytes_read = fwl_cursor_advance(&tmp_pos, devbuf, devbuf_size,
-						&word_list);
-		if (!bytes_read)
-			break;
+	down_read(&rw_sem);
 
+	if (list_empty(&word_list))
+		goto done;
+
+	while (total_read < count) {
+		bytes_read = fwl_cursor_advance_locked(&tmp_pos, devbuf,
+						       devbuf_size, &word_list);
+		if (!bytes_read)
+			goto done;
+
+		up_read(&rw_sem);
 		not_copied = copy_to_user(buf + total_read, devbuf, bytes_read);
+		down_read(&rw_sem);
+
 		total_read += bytes_read - not_copied;
 		if (!total_read) {
 			ret = -EFAULT;
-			break;
+			goto done;
 		}
 		if (not_copied) {
-			fwl_cursor_advance(pos, NULL, bytes_read - not_copied,
-					   &word_list);
-			break;
+			fwl_cursor_advance_locked(
+				pos, NULL, bytes_read - not_copied, &word_list);
+			goto done;
 		}
 		*pos = tmp_pos;
 	}
 
+done:
+	up_read(&rw_sem);
 	return ret ? ret : total_read;
 }
 
@@ -890,36 +905,28 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 	pr_debug("called\n");
 
 	if (!count)
-		goto zero_read;
+		return 0;
 
-	/* this is cheap and can prevent unnecessary allocations */
+	/* this is relatively cheap and can prevent unnecessary allocations */
 	down_read(&rw_sem);
 	empty_list = list_empty(&word_list);
 	up_read(&rw_sem);
 
 	if (empty_list)
-		goto zero_read;
+		return 0;
 
 	devbuf_size = min(count, FWL_MAX_BUF);
 	devbuf = kmalloc(devbuf_size, GFP_KERNEL);
-	if (!devbuf) {
-		ret = -ENOMEM;
-		goto zero_read;
-	}
+	if (!devbuf)
+		return -ENOMEM;
 
 	mutex_lock(&ofd_data->lock);
-	down_read(&rw_sem);
-
-	if (list_empty(&word_list))
-		goto done;
-
-	ret = fwl_read_to_user(&ofd_data->pos, buf, count, devbuf, devbuf_size);
-
-done:
-	up_read(&rw_sem);
+	ret = fwl_read_to_user_locked(&ofd_data->pos, buf, count, devbuf,
+				      devbuf_size);
 	mutex_unlock(&ofd_data->lock);
+
 	kfree(devbuf);
-zero_read:
+
 	return ret;
 }
 
