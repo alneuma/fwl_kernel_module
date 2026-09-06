@@ -441,13 +441,13 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 					   const char __user *buf, size_t count,
 					   char *devbuf, size_t buf_size)
 {
-	lockdep_assert_held(&ofd_data->lock);
-
 	size_t to_copy;
 	int ret = 0;
 	unsigned long not_copied;
 	struct fwl_word *stash = ofd_data->stash;
 	bool stash_owned = false;
+
+	lockdep_assert_held(&ofd_data->lock);
 
 	INIT_LIST_HEAD(&trans->words);
 	trans->stash = NULL;
@@ -505,12 +505,12 @@ static int
 fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 				       struct fwl_ofd *ofd_data)
 {
-	lockdep_assert_held(&ofd_data->lock);
-	lockdep_assert_held_write(&rw_sem_user);
-
 	struct fwl_word *e;
 	size_t new_mem_used = 0;
 	u32 tmp_idx = next_node_idx;
+
+	lockdep_assert_held(&ofd_data->lock);
+	lockdep_assert_held_write(&rw_sem_user);
 
 	if (trans->stash)
 		new_mem_used = fwl_word_size(trans->stash);
@@ -554,11 +554,11 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 					 struct list_head *words,
 					 bool *should_log, size_t *copied)
 {
-	lockdep_assert_held(&ofd_data->lock);
-	lockdep_assert_held(&rw_sem_user);
-
 	int ret = 0;
 	*should_log = false;
+
+	lockdep_assert_held(&ofd_data->lock);
+	lockdep_assert_held(&rw_sem_user);
 
 	ret = fwl_transaction_update_counters_locked(trans, ofd_data);
 	if (ret)
@@ -794,12 +794,12 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 static size_t fwl_cursor_advance_locked(struct fwl_cursor *pos, char *buf,
 					size_t count, struct list_head *words)
 {
-	/* can not assert ofd_data->lock held, as it is not accessible here */
-	lockdep_assert_held_read(&rw_sem_user);
-
 	struct fwl_word *e;
 	size_t copy_size;
 	size_t idx = 0;
+
+	/* can not assert ofd_data->lock held, as it is not accessible here */
+	lockdep_assert_held_read(&rw_sem_user);
 
 	if (list_empty(words))
 		return 0;
