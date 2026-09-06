@@ -774,14 +774,7 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
  *
  * A separator is "owned" by the word that comes before it. This means, that the
  * cursor does only advance to the next word, when the current word's trailing
- * separator is written. So the during regular reading
- *
- * pos->on_sep, is logically equivalent pos->word_pos.
- *
- * This rule is violated, when the cursor is advanced because of pointing
- * to a no longer existing word. In this situation we get
- *
- * pos->on_sep && pos->word_pos == 0.
+ * separator is written.
  *
  */
 static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
