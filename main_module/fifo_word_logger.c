@@ -113,9 +113,9 @@
  * *** Caveats ***
  *
  * - word length and list length are unbound.
- * - use of persistent memory is bound, but might not precisely represent the
- *   actual persistent memory held, as kmalloc() can overallocate.
- * - use of transient memory is not bound
+ * - use of persistent memory is bound, but does not take into account
+ *   kmalloc()'s allocator overhead.
+ * - use of transient memory is not bound.
  *
  * Locks:
  *
@@ -181,7 +181,6 @@ struct fwl_ofd {
 	struct fwl_word *stash;
 };
 
-/* bytes are not used yet */
 struct fwl_transaction_write {
 	struct list_head words;
 	struct fwl_word *stash;
@@ -335,7 +334,6 @@ static size_t fwl_word_list_clear(struct list_head *list)
  * prefix_len + suffix_len == 0		-> -EINVAL
  * prefix == NULL && prefix_len > 0	-> -EINVAL
  * suffix == NULL && suffix_len > 0	-> -EINVAL
- *
  */
 static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
@@ -605,33 +603,20 @@ static int fwl_open(struct inode *inode, struct file *filp)
 
 	pr_debug("called\n");
 
-	/* This first check is cheap and can prevent unnecessary allocation. */
-	down_read(&rw_sem_user);
-	mem_tmp = mem_used;
-	up_read(&rw_sem_user);
-
-	if (check_add_overflow(mem_tmp, sizeof(struct fwl_ofd), &mem_tmp))
-		return -EOVERFLOW;
-	else if (mem_tmp > FWL_MAX_MEM)
-		return -ENOSPC;
-
 	ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
 		return -ENOMEM;
 
-	mutex_init(&ofd_data->lock);
-
 	down_write(&rw_sem_user);
-
 	if (check_add_overflow(mem_used, sizeof(*ofd_data), &mem_tmp))
 		ret = -EOVERFLOW;
 	else if (mem_tmp > FWL_MAX_MEM)
 		ret = -ENOSPC;
-
 	up_write(&rw_sem_user);
 
 	if (!ret) {
 		mem_used = mem_tmp;
+		mutex_init(&ofd_data->lock);
 		filp->private_data = ofd_data;
 	} else
 		kfree(ofd_data);
