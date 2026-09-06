@@ -790,12 +790,15 @@ static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
 		++idx;
 	}
 
+	fwl_cursor_log(pos, "after update");
+
 	e = list_entry(pos->ptr, struct fwl_word, node);
 	if (pos->word_pos == e->len) {
 		if (list_is_last(pos->ptr, words))
 			goto done;
 		if (buf)
 			buf[idx] = FWL_WORD_SEP;
+		++idx;
 		pos->ptr = pos->ptr->next;
 		pos->word_pos = 0;
 	}
@@ -811,11 +814,13 @@ static size_t fwl_cursor_advance(struct fwl_cursor *pos, char *buf,
 			goto done;
 		if (buf)
 			buf[idx] = FWL_WORD_SEP;
+		++idx;
 		pos->ptr = pos->ptr->next;
 		pos->word_pos = 0;
 	}
 
 done:
+	e = list_entry(pos->ptr, struct fwl_word, node);
 	pos->node_idx = e->idx;
 	return idx;
 }
