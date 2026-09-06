@@ -491,6 +491,10 @@ done:
  * Assigns indices to transaction list and updates total memory usage.
  * On failure no shared state will be modified.
  *
+ * Note:
+ * Because every transaction already incorporates ofd_data->stash, the total
+ * memory committed is always >= 0.
+ *
  * will fail when:
  * - memory exhaustion
  * - node index exhaustion
@@ -500,36 +504,33 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 				       struct fwl_ofd *ofd_data)
 {
 	struct fwl_word *e;
-	size_t bytes = 0;
+	size_t new_mem_used = 0;
 	u32 tmp_idx = next_node_idx;
 
-	if (trans->stash &&
-	    check_add_overflow(bytes, fwl_word_size(trans->stash), &bytes))
-		return -EOVERFLOW;
-
-	if (bytes > FWL_MAX_MEM)
-		return -ENOSPC; /* consider letting this block */
+	if (trans->stash)
+	    new_mem_used = fwl_word_size(trans->stash);
 
 	list_for_each_entry(e, &trans->words, node) {
 		if (!tmp_idx)
 			return -ENOSPC;
-		if (check_add_overflow(bytes, fwl_word_size(e), &bytes))
+		if (check_add_overflow(new_mem_used, fwl_word_size(e),
+				       &new_mem_used))
 			return -EOVERFLOW;
 		e->idx = tmp_idx++;
 	}
 
-	if (bytes > FWL_MAX_MEM)
-		return -ENOSPC; /* consider letting this block */
+	/* no need to check overflow, see note */
+	if (ofd_data->stash)
+		new_mem_used -= fwl_word_size(ofd_data->stash);
 
-	if (ofd_data->stash &&
-	    check_sub_overflow(bytes, fwl_word_size(ofd_data->stash), &bytes))
+	if (check_add_overflow(mem_used, new_mem_used, &new_mem_used))
 		return -EOVERFLOW;
 
-	if (check_add_overflow(mem_used, bytes, &bytes))
-		return -EOVERFLOW;
+	if (new_mem_used > FWL_MAX_MEM)
+		return -ENOSPC;
 
 	next_node_idx = tmp_idx;
-	mem_used = bytes;
+	mem_used = new_mem_used;
 
 	return 0;
 }
