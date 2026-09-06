@@ -11,7 +11,8 @@
  *
  * Splits content of the buffer into words and appends these words to the queue.
  * A word is any sequence of bytes that is surrounded by separators.
- * A separator is any byte, that is FWL_WORD_SEP, the zero byte or any byte for which isspace() returns true.
+ * A separator is any byte, that is FWL_WORD_SEP, the zero byte or any byte for
+ * which isspace() returns true.
  * The first byte of the first call to write() from a newly created ofd (open
  * file description) is considered to be to the right of a separator.
  * Similarly the last byte written before an ofd is released is considered to be
@@ -33,9 +34,9 @@
  *
  * This behavior is implemented saving per ofd state of unfinished word: Any
  * word that remains unfinished (i.e. without a separator to its right) after a
- * call to read() is not committed to the queue, but instead saved as ofd private
- * data. When no ofd is released any remaining unfinished word is committed to
- * the queue.
+ * call to read() is not committed to the queue, but instead saved as ofd
+ * private data. When no ofd is released any remaining unfinished word is
+ * committed to the queue.
  *
  * read()
  *
@@ -154,7 +155,6 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
-
 
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
@@ -661,7 +661,8 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		up_write(&rw_sem_user);
 		if (should_log)
-			(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
+			(void)schedule_delayed_work(&fwl_work,
+						    FWL_LOG_INTERVAL);
 	}
 
 	kfree(filp->private_data);
