@@ -219,19 +219,25 @@ static size_t fwl_word_size(const struct fwl_word *word)
  * there is more to consume	-> true
  * otherwise			-> false
  *
- * Will not be called if queue is empty.
- * This is ascertained by a set of invariants see discussion on top of file
+ * The current scheduling model ascertains that fwl_consume_first_word() will
+ * never be called when words is empty.
  */
 static bool fwl_consume_first_word(struct list_head *words)
 {
 	struct fwl_word *e;
 	int len;
-	bool keep_going = true;
+	bool keep_going;
 
 	down_write(&rw_sem_logging);
 	down_write(&rw_sem_user);
 
-	e = list_first_entry(words, struct fwl_word, node);
+	e = list_first_entry_or_null(words, struct fwl_word, node);
+	if (!e) { /* this should never happen */
+		up_write(&rw_sem_user);
+		up_write(&rw_sem_logging);
+		return false;
+	}
+
 	list_del_init(&e->node);
 	mem_used -= fwl_word_size(e);
 	keep_going = !list_empty(&word_list);
