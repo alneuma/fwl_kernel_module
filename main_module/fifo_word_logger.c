@@ -350,12 +350,11 @@ static size_t fwl_word_list_clear(struct list_head *list)
  * success -> 0
  * failure -> error < 0
  *
- * checked runtime errors:
- * prefix_len + suffix_len == 0 -> -EINVAL
- * 
- * unchecked runtime errors:
- * prefix == NULL && prefix_len > 0
- * suffix == NULL && suffix_len > 0
+ * checked contract violations:
+ * prefix_len + suffix_len == 0		-> -EINVAL
+ * prefix == NULL && prefix_len > 0	-> -EINVAL
+ * suffix == NULL && suffix_len > 0	-> -EINVAL
+ *
  */
 static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 			 size_t prefix_len, const char *suffix,
@@ -366,9 +365,13 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 
 	pr_debug("called\n");
 
+	if (!prefix && prefix_len)
+		return -EINVAL;
+	if (!suffix && suffix_len)
+		return -EINVAL;
+
 	if (check_add_overflow(prefix_len, suffix_len, &len))
 		return -EOVERFLOW;
-
 	if (!len)
 		return -EINVAL;
 
