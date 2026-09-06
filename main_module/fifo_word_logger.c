@@ -325,7 +325,7 @@ static void fwl_start_logging(void)
  */
 static bool fwl_word_delim(char c)
 {
-	return isspace((unsigned char)c) || c == 0x0 || c == FWL_WORD_SEP;
+	return isspace((unsigned char)c) || c == '\0' || c == FWL_WORD_SEP;
 }
 
 /*
