@@ -107,8 +107,6 @@
  *     section during which it caused (1), the queue's state has already changed
  *     to non-empty. So no other thread will be contesting for starting the
  *     logging sequence.
- * (f) (c), (d) and (e) guarantee, that access to the shared variable
- *     fwl_next_log will always be uncontested.
  *
  * One imaginative edge cases:
  *
@@ -124,6 +122,7 @@
  * - word length and list length are unbound.
  * - use of persistent memory is bound, but might not precisely represent the
  *   actual persistent memory held, as kmalloc() can overallocate.
+ * - use of transient memory is not bound
  *
  * Locks:
  *
@@ -133,6 +132,7 @@
  *
  * rw_sem_logging
  * protects shared state access from logging during specific inopportune moments
+ * e.g. while read() unlocks rw_sem_user for calling copy_to_user()
  *
  * rw_sem_user
  * protects module wide shared state
@@ -196,7 +196,6 @@ static dev_t devt;
 static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
-static unsigned long fwl_next_log;
 static struct delayed_work fwl_work;
 static u32 next_node_idx = 1;
 static size_t mem_used = 0;
@@ -253,15 +252,14 @@ static bool fwl_consume_first_word(struct list_head *words)
 /*
  * fwl_schedule_work()
  */
-static void fwl_schedule_work(struct work_struct *work)
+static void fwl_schedule_work(struct work_struct *work, unsigned long next_log)
 {
 	unsigned long delay;
 
-	fwl_next_log += FWL_LOG_INTERVAL;
-	if (time_before(fwl_next_log, jiffies))
+	if (time_before(next_log, jiffies))
 		delay = 0;
 	else
-		delay = fwl_next_log - jiffies;
+		delay = next_log - jiffies;
 
 	(void)schedule_delayed_work(to_delayed_work(work), delay);
 }
@@ -281,10 +279,19 @@ static void fwl_schedule_work(struct work_struct *work)
  */
 static void fwl_work_handler(struct work_struct *work)
 {
-	bool done = fwl_consume_first_word(&word_list);
+	static bool next_log_set = false;
+	static unsigned long next_log = 0;
 
-	if (!done)
-		fwl_schedule_work(work);
+	if (!next_log_set) {
+		next_log = jiffies + FWL_LOG_INTERVAL;
+		next_log_set = true;
+	} else
+		next_log += FWL_LOG_INTERVAL;
+
+	if (fwl_consume_first_word(&word_list))
+		fwl_schedule_work(work, next_log);
+	else
+		next_log_set = false;
 }
 
 /*
@@ -301,7 +308,6 @@ static void fwl_work_handler(struct work_struct *work)
 static void fwl_start_logging(void)
 {
 	(void)cancel_delayed_work_sync(&fwl_work);
-	fwl_next_log = jiffies + FWL_LOG_INTERVAL;
 	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 }
 
