@@ -1033,7 +1033,7 @@ static void __exit fwl_exit(void)
 	cdev_del(&fifo_word_logger);
 	unregister_chrdev_region(devt, 1);
 	mem_used -= fwl_word_list_clear(&word_list);
-	BUG_ON(mem_used);
+	WARN_ON(mem_used);
 
 	pr_info("%s removed successfully\n", FWL_DRIVER_NAME);
 }
