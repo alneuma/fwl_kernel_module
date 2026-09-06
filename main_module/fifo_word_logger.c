@@ -128,7 +128,8 @@
  *
  * ofd local lock
  * protects ofd local state from concurrent reads/writes
- * release() is exempt from this.
+ * release() is exempt from this, as it is only called when all other references
+ * to an ofd are gone.
  *
  * rw_sem_logging
  * protects shared state access from logging during specific inopportune moments
@@ -309,6 +310,9 @@ static void fwl_work_handler(struct work_struct *work)
  */
 static void fwl_start_logging(void)
 {
+	lockdep_assert_not_held(&rw_sem_logging);
+	lockdep_assert_not_held(&rw_sem_user);
+
 	(void)cancel_delayed_work_sync(&fwl_work);
 	(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 }
@@ -460,6 +464,8 @@ static int fwl_transaction_populate_locked(struct fwl_transaction_write *trans,
 					   const char __user *buf, size_t count,
 					   char *devbuf, size_t buf_size)
 {
+	lockdep_assert_held(&ofd_data->lock);
+
 	size_t to_copy;
 	int ret = 0;
 	unsigned long not_copied;
@@ -522,6 +528,9 @@ static int
 fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 				       struct fwl_ofd *ofd_data)
 {
+	lockdep_assert_held(&ofd_data->lock);
+	lockdep_assert_held_write(&rw_sem_user);
+
 	struct fwl_word *e;
 	size_t new_mem_used = 0;
 	u32 tmp_idx = next_node_idx;
@@ -557,7 +566,7 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 /*
  * fwl_transaction_commit()
  *
- * must hold both mutexes
+ * must hold ofd_data->lock and rw_sem_user
  *
  * will fail when:
  * - memory exhaustion
@@ -568,6 +577,9 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 					 struct list_head *words,
 					 bool *should_log, size_t *copied)
 {
+	lockdep_assert_held(&ofd_data->lock);
+	lockdep_assert_held(&rw_sem_user);
+
 	int ret = 0;
 	*should_log = false;
 
@@ -816,6 +828,9 @@ static bool fwl_cursor_update(struct fwl_cursor *pos, struct list_head *words)
 static size_t fwl_cursor_advance_locked(struct fwl_cursor *pos, char *buf,
 					size_t count, struct list_head *words)
 {
+	/* can not assert ofd_data->lock held, as it is not accessible here */
+	lockdep_assert_held_read(&rw_sem_user);
+
 	struct fwl_word *e;
 	size_t copy_size;
 	size_t idx = 0;
@@ -896,6 +911,8 @@ static ssize_t fwl_read_to_user_locked(struct fwl_cursor *pos, char __user *buf,
 				       size_t count, char *devbuf,
 				       size_t devbuf_size)
 {
+	/* can not assert ofd_data->lock held, as it is not accessible here */
+
 	struct fwl_cursor tmp_pos = *pos;
 	size_t not_copied;
 	size_t bytes_read;
