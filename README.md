@@ -1,10 +1,11 @@
-# Fifo Word Logger
+# FWL - FIFO Word Logger
+*A dynamically loadable character device for the Linux kernel*
 
-*Write words into the device, read them back, log them one by one. What could possibly go wrong? What looked simple at first turned out to be a roller-coaster through kernel concepts, ownership and concurrency.*
+## Overview
 
-A Linux kernel character-device driver implementing a concurrent FIFO word queue with per-OFD state, asynchronous consumption, failure-atomic writes, bounded persistent memory, and explicitly defined semantics under concurrent reads, writes, and queue mutation.
-
-Words are received through `write()`, exposed as a byte stream through `read()`, and logged to the kernel ring buffer in FIFO order. A word can span multiple `write()` calls on the same open file description (OFD), while different OFDs remain independent.
+Write words into the device, read them back, log them one by one. What could possibly go wrong?
+A Linux kernel character device that accepts a byte stream, reconstructs words across write() calls, exposes the queue through read(), and asynchronously logs/dequeues one word per second.
+The interesting part isn't the queue. It's making all of that well-defined when multiple OFDs access it concurrently, asynchronous logging mutates the queue, allocations fail, resources get exhausted and readers can hold positions into state that disappears underneath them.
 
 > **Kernel:** Linux 6.12.105\
 > **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
@@ -21,6 +22,14 @@ The data structure itself is simple. The interesting part is making it behave pr
 - This state mutation can happen between reads.
 - Allocations and user-space memory accesses can fail.
 - Resource exhaustion can happen.
+
+## Technical Highlights
+
+- per-OFD state
+- asynchronous mutation of shared state
+- failure-atomic writes
+- bounded persistent memory
+- well defined behavior under concurrent reads, writes, and queue mutation.
 
 ## What I have learned
 
@@ -252,23 +261,20 @@ The kernels KSAN, KMEMLEAK and KLOCKDEP did substantial work
 
 I have not stress tested the module with multiple concurrent accesses.
 
-### Overview of performed testing duties
+## Overview of performed testing duties
 
-| Area | Tested |
-|-|-|
-| Partial words across writes | Yes |
-| Small read() buffers | Yes |
-| Queue mutation during reads | Yes |
-| Memory exhaustion	| Yes |
-| Index exhaustion | Yes |
-| Ran with KASAN | Yes |
-| Ran with KMEMLEAK | Yes |
-| Ran with LOCKDEP | Yes |
-| Allocation failures | partially |
-| Concurrent reads | No |
-| Concurrent writes | No |
-| Concurrent read/write | No |
-| Multiple concurrent OFDs | No |
+| Area | Designed for | Tested |
+|-|-|-|
+| per-OFD managed partial words across writes | Yes | Yes |
+| Small read()/write() buffers | Yes | Yes |
+| Very large read()/write() buffer | Yes | Yes |
+| Queue mutation inbetween reads | Yes | Yes |
+| Resource exhaustion | Partially | Yes |
+| Allocation failures | Yes | partially |
+| Concurrent reads | Yes | No |
+| Concurrent writes | Yes | No |
+| Concurrent read/write | Yes | No |
+| Multiple concurrent OFDs | Yes | No |
 
 ## Possible refinements for future iterations
 
