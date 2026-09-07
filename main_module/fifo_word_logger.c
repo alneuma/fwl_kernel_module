@@ -201,11 +201,13 @@ static size_t mem_used = 0;
 /*
  * debugging functions
  */
+#ifdef DEBUG
 static void fwl_counters_log(const char *label);
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
 static void fwl_transaction_log(const struct fwl_transaction_write *t,
 				const char *label);
+#endif
 
 static size_t fwl_word_size(const struct fwl_word *word)
 {
@@ -688,7 +690,6 @@ static int fwl_release(struct inode *inode, struct file *filp)
 
 		up_write(&rw_sem_user);
 
-
 		if (should_log)
 			(void)schedule_delayed_work(&fwl_work,
 						    FWL_LOG_INTERVAL);
@@ -1076,6 +1077,7 @@ MODULE_DESCRIPTION("character device experiment using a list");
 /*
  * debugging functions
  */
+#ifdef DEBUG
 static void fwl_counters_log(const char *label)
 {
 	pr_debug("%s\n", label);
@@ -1105,3 +1107,4 @@ static void fwl_list_log(const struct list_head *l, const char *label)
 		pr_debug("node %u: %.*s\n", e->idx, (int)e->len, e->word);
 	}
 }
+#endif
