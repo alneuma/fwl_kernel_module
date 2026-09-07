@@ -194,7 +194,8 @@ static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
 static struct delayed_work fwl_work;
-static u32 next_node_idx = 1;
+static u32 node_idx_next = 0;
+static u32 node_idx_num_reserved = 0;
 static size_t mem_used = 0;
 
 /*
@@ -488,6 +489,24 @@ done:
 }
 
 /*
+ * fwl_node_idx_reserved_update()
+ */
+static int fwl_node_idx_reserved_update(u32 *new_reserved, u32 old_reserved,
+					const struct fwl_word *old_stash,
+					const struct fwl_word *new_stash)
+{
+	*new_reserved = old_reserved;
+	if (old_stash && !new_stash)
+		*new_reserved -= 1;
+	else if (!old_stash && new_stash) {
+		if (check_add_overflow(old_reserved, 1, new_reserved))
+			return -ENOSPC;
+	}
+
+	return 0;
+}
+
+/*
  * fwl_transaction_update_counters_locked()
  *
  * Assigns indices to transaction list and updates total memory usage.
@@ -507,7 +526,8 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 {
 	struct fwl_word *e;
 	size_t new_mem_used = 0;
-	u32 tmp_idx = next_node_idx;
+	u32 tmp_idx = node_idx_next;
+	u32 tmp_reserved = node_idx_num_reserved;
 
 	lockdep_assert_held(&ofd_data->lock);
 	lockdep_assert_held_write(&rw_sem_user);
