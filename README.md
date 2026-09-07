@@ -98,9 +98,10 @@ For this implementation I went with 3. If an OFD already started reading a remov
 ? = " you"
 ```
 
-### Some less interesting details
+#### Some less interesting details
 
-#### error codes etc.
+- There is a limit to persistent memory. If it is reached write attempts return `-ENOSPC`. This deserves special note, as persistent is constantly released during logging events.
+- There is a possibility of [index exhaustion](#####indices-are-finite) when this occurs, also `-ENOSPC` is returned to `write()`.
 
 ## Implementation
 
@@ -212,159 +213,14 @@ An advantage of the index only approach is that there is one less pointer variab
 
 The current strategy for memory accounting is still really rough around the corners. There is a device wide memory limit to dynamic memory usage only for persistent state, i.e. queue nodes and per OFD state. Transiently used memory which for e.g. could accumulate during many concurrent `write()` calls is not limited yet. To make things worse allocator overhead is not taken into account when calculation currently occupied memory. This should be one of the first things to be reworked during future iterations.
 
-## The most challenging parts
-
-### define the interrelation between logging and read() semantics
-### Reasoning about concurrency and shared state changes caused by the logger
-
 ## Possible refinements for future iterations
 
-### Add a limit to the word size
-### Command line configuration during module loading
-- word size limit
-- logging interval
-- memory limit
-### More elaborate testing setup
-### Reworked memory management and accounting
-### poll() and blocking behavior when appropriate
-### More systematic documentation of invariants and concurrency considerations
-
-/*
- * fifo_word_logger
- *
- * A character device that reads words and appends them to a queue.
- * Once per second the oldest word is logged and removed from the queue.
- * Counting starts as soon as the queue moves from empty to non-empty.
- *
- * *** Interface ***
- *
- * write()
- *
- * Splits content of the buffer into words and appends these words to the queue.
- * A word is any sequence of bytes that is surrounded by separators.
- * A separator is any byte, that is FWL_WORD_SEP, the zero byte or any byte for
- * which isspace() returns true.
- * The first byte of the first call to write() from a newly created ofd (open
- * file description) is considered to be to the right of a separator.
- * Similarly the last byte written before an ofd is released is considered to be
- * to the left of a separator.
- *
- * Word integrity between different calls to write() issued through the same ofd
- * is preserved. So if, during the lifetime of an ofd, we assume two consecutive
- * writes of size 4:
- *
- * "Hell" and "o Yo"
- *
- * , then
- *
- * "Hello" -- "Yo"
- * 
- * will be appended to the list, not
- *
- * "Hell" -- "o" -- "Yo"
- *
- * This behavior is implemented saving per ofd state of unfinished word: Any
- * word that remains unfinished (i.e. without a separator to its right) after a
- * call to read() is not committed to the queue, but instead saved as ofd
- * private data. When no ofd is released any remaining unfinished word is
- * committed to the queue.
- *
- * read()
- *
- * Writes all the currently enqueued words to the read buffer, separated by
- * FWL_WORD_SEP. The read position is saved per ofd.
- * It can occur, that between two calls to read() this position becomes
- * invalidated. This happens if between the two calls the word this position
- * refers after the first call gets removed from the queue.
- * In this case reading continues at the new first word of the queue,
- * potentially prepended by FWL_WORD_SEP, to distinguish it from a partial
- * read of the now dequeued word.
- *
- * When there are currently no more words to read, then EOF gets returned,
- * although more words could be committed later.
- * We might want to implement polling later.
- *
- * *** node indexing ***
- * 
- * To determine if a read cursor still points at a valid word node, each word
- * node has a unique index. Indices are represented by an unsigned integer type,
- * are finite and can not be reused. Indexing starts at 1. If assigning a next
- * index during write() would overflow the index counter, -ENOSPC is returned.
- *
- * *** memory limits ***
- * 
- * There is a maximum number of bytes that is allowed to be occupied by the
- * persistent device state. Objects counted are:
- * - nodes of the queue
- * - per ofd private data
- *
- * *** logging semantics and implementation ***
- * 
- * A new logging sequence starts when the state of the queue switches from empty 
- * to non-empty. The first logging event is scheduled to happen one second after
- * this. The work item's callback function does then establish the next_log
- * variable which always represents the ideal next log time. This variable is
- * used to counteract timer drift from the moment on the first callback happens.
- *
- * Thoughts about concurrency:
- * So the two relevant events for controlling the logging are associated with
- * changes in the queue's state:
- *
- * (1) empty -> non-empty causes logging to start
- * (2) non-empty -> empty causes logging to stop
- *
- * - Event (1) is entirely controlled by fwl_write() and fwl_release().
- * - Event (2) is entirely controlled by the callback, fwl_work_handler().
- * - Each of those events is locked to happen atomically.
- * - When fwl_write() causes (1) it will schedule a work item.
- * - When fwl_release() causes (1) it will schedule a work item.
- * - When fwl_work_handler() causes (2) it will not reschedule itself
- *
- * This gives the following guarantees:
- *
- * (a) When the queue is empty there is either no work item scheduled or the
- *     callback is currently executing, has caused (2) and has already
- *     determined that it will not reschedule itself.
- *
- * (b) When the queue is non-empty and (1) did not happen recently, the self
- *     rescheduling logging mechanism is running and neither fwl_write() nor
- *     fwl_release() are trying to schedule work items.
- *
- * (c) When (1) happened recently, i.e. the function that caused it is
- *     still executing but has not yet scheduled a new work item, then no work
- *     item is scheduled yet and no other thread is bound to schedule one. This
- *     holds because (1) happened atomically, so for the callback the conditions
- *     under (a) still hold. Likewise, also because of the atomicity, no other
- *     fwl_write()/fwl_release() thread can have caused (1) and as such no other
- *     fwl_write()/fwl_release() thread will attempt scheduling.
- * 
- * All of this guarantees that the control of starting/stopping a periodic
- * logging sequence will happen uncontested.
- *
- * *** Caveats ***
- *
- * - word length and list length are unbound.
- * - use of persistent memory is bound, but does not take into account
- *   kmalloc()'s allocator overhead.
- * - use of transient memory is not bound.
- *
- * Locks:
- *
- * ofd local lock
- * protects ofd local state from concurrent reads/writes
- * release() is exempt from this, as it is only called when all other references
- * to an ofd are gone.
- *
- * rw_sem_logging
- * protects shared state access from logging during specific inopportune moments
- * e.g. while read() unlocks rw_sem_user for calling copy_to_user()
- *
- * rw_sem_user
- * protects module wide shared state
- *
- * lock ordering
- * 1. ofd local lock
- * 2. rw_sem_logging
- * 3. rw_sem_user
- */
-// #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+- [ ] add a limit to the size of a single word
+- [ ] add command line configuration during module loading
+    - [ ] word size limit
+    - [ ] logging interval
+    - [ ] memory limit
+- [ ] establish more elaborate testing routines
+- [ ] reworked memory management and accounting
+- [ ] implementation of poll() and blocking behavior when appropriate
+- [ ] more systematic documentation if invariants and concurrency arguments
