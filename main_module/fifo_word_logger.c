@@ -56,10 +56,9 @@
  * *** node indexing ***
  * 
  * To determine if a read cursor still points at a valid word node, each word
- * node has a unique index. Indices are represented by an unsigned integer type
- * and are finite. Indexing starts at 1 and 0 is used as a sentinel value. If
- * the next index to assign would be 0. We know that the next_index variable has
- * wrapped around and the pool of indices is exhausted.
+ * node has a unique index. Indices are represented by an unsigned integer type,
+ * are finite and can not be reused. Indexing starts at 1. If assigning a next
+ * index during write() would overflow the index counter, -ENOSPC is returned.
  *
  * *** memory limits ***
  * 
@@ -194,7 +193,7 @@ static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
 static struct delayed_work fwl_work;
-static u32 node_idx_next = 0;
+static u32 node_idx_counter = 0;
 static u32 node_idx_num_reserved = 0;
 static size_t mem_used = 0;
 
@@ -529,7 +528,7 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 {
 	struct fwl_word *e;
 	size_t tmp_mem_used = 0;
-	u32 tmp_idx = node_idx_next;
+	u32 tmp_idx = node_idx_counter;
 	u32 tmp_idx_reserved;
 	u32 dummy;
 
@@ -566,7 +565,7 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 		return -ENOSPC;
 
 	node_idx_num_reserved = tmp_idx_reserved;
-	node_idx_next = tmp_idx;
+	node_idx_counter = tmp_idx;
 	mem_used = tmp_mem_used;
 
 	return 0;
@@ -661,9 +660,7 @@ static int fwl_open(struct inode *inode, struct file *filp)
 
 /*
  * fwl_release()
- * cleans up and commits any unfinished words from per ofd_data->stash to list
- * TODO: consider reserving an index when opening, such that closing can never
- * return -ENOSPC. The current version is slightly awkward.
+ * If there was a stash, a node index was reserved before.
  */
 static int fwl_release(struct inode *inode, struct file *filp)
 {
@@ -675,23 +672,18 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	pr_debug("called\n");
 
 	if (stash) {
+
 		down_write(&rw_sem_user);
 
-		if (!next_node_idx) {
-			mem_used -= sizeof(struct fwl_ofd);
-			mem_used -= fwl_word_size(stash);
-			up_write(&rw_sem_user);
-			kfree(stash);
-			kfree(filp->private_data);
-			return -ENOSPC;
-		}
-		stash->idx = next_node_idx++;
+		stash->idx = ++node_idx_counter;
+		--node_idx_num_reserved;
 
 		should_log = list_empty(&word_list);
 
 		list_add_tail(&stash->node, &word_list);
 
 		up_write(&rw_sem_user);
+
 		if (should_log)
 			(void)schedule_delayed_work(&fwl_work,
 						    FWL_LOG_INTERVAL);
