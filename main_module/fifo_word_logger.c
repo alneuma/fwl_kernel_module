@@ -136,7 +136,8 @@
  * 2. rw_sem_logging
  * 3. rw_sem_user
  */
-#define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+// #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+#define pr_fmt(fmt) "%s: " fmt, "fwl"
 
 #include <linux/cdev.h>
 #include <linux/ctype.h>
@@ -157,9 +158,11 @@
 
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
-#define FWL_LOG_INTERVAL HZ
+#define FWL_LOG_INTERVAL (HZ / 100)
 #define FWL_MAX_BUF 1024
 #define FWL_MAX_MEM (1024 * 1024)
+
+#define u32 unsigned char
 
 struct fwl_word {
 	struct list_head node;
@@ -200,6 +203,7 @@ static size_t mem_used = 0;
 /*
  * debugging functions
  */
+static void fwl_counters_log(const char *label);
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
 static void fwl_transaction_log(const struct fwl_transaction_write *t,
@@ -243,7 +247,7 @@ static bool fwl_consume_first_word(struct list_head *words)
 	up_write(&rw_sem_logging);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
-	pr_info("%.*s\n", len, e->word);
+	pr_info("log %u: %.*s\n", e->idx, len, e->word);
 	kfree(e);
 
 	return keep_going;
@@ -342,7 +346,7 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 	size_t len;
 	size_t size;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (!prefix && prefix_len)
 		return -EINVAL;
@@ -384,7 +388,7 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 	size_t wstart = 0;
 	struct fwl_word *new_word = NULL;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (old_stash) {
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
@@ -591,7 +595,10 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	lockdep_assert_held(&ofd_data->lock);
 	lockdep_assert_held(&rw_sem_user);
 
+	fwl_counters_log("---- before ----");
 	ret = fwl_transaction_update_counters_locked(trans, ofd_data);
+	fwl_counters_log("---- after ----");
+
 	if (ret)
 		return ret;
 
@@ -605,8 +612,6 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	trans->stash = NULL;
 
 	*copied = trans->bytes_copied;
-
-	pr_debug("mem_used: %zu\n", mem_used);
 
 	return 0;
 }
@@ -625,8 +630,6 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
 /*
  * fwl_open()
  * initialized per ofd data
- * TODO: consider reserving an index when opening, such that closing can never
- * return -ENOSPC. The current version is slightly awkward.
  */
 static int fwl_open(struct inode *inode, struct file *filp)
 {
@@ -634,7 +637,7 @@ static int fwl_open(struct inode *inode, struct file *filp)
 	size_t mem_tmp = 0;
 	int ret = 0;
 
-	pr_debug("called\n");
+	pr_debug("---- open() ----\n");
 
 	ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
@@ -669,7 +672,7 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	ofd_data->stash = NULL;
 	bool should_log = false;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (stash) {
 
@@ -740,7 +743,7 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	bool should_log = false;
 	int ret = 0;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (!count)
 		return 0;
@@ -771,8 +774,7 @@ done:
 
 	if (ret)
 		fwl_transaction_clear(&trans);
-
-	if (should_log)
+	else if (should_log)
 		(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 
 	return ret ? ret : copied;
@@ -958,7 +960,7 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 
 	(void)f_pos;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (!count)
 		return 0;
@@ -1072,28 +1074,32 @@ MODULE_DESCRIPTION("character device experiment using a list");
 /*
  * debugging functions
  */
+static void fwl_counters_log(const char *label)
+{
+	pr_debug("%s\n", label);
+	pr_debug("node_idx_counter = %u\n", node_idx_counter);
+	pr_debug("node_idx_num_reserved = %u\n", node_idx_num_reserved);
+	pr_debug("mem_used: %zu\n", mem_used);
+}
 static void fwl_transaction_log(const struct fwl_transaction_write *t,
 				const char *label)
 {
-	pr_debug("%s:\n", label);
-
+	pr_debug("%s\n", label);
 	pr_debug("t->stash = %p\n", t->stash);
 	pr_debug("t->bytes_copied = %zu\n", t->bytes_copied);
 }
-
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 {
-	pr_debug("%s:\n", label);
+	pr_debug("%s\n", label);
 	pr_debug("ptr = %p\n", c->ptr);
 	pr_debug("word_pos = %zu\n", c->word_pos);
 	pr_debug("node_idx = %u\n", c->node_idx);
 }
-
 static void fwl_list_log(const struct list_head *l, const char *label)
 {
 	struct fwl_word *e;
 
-	pr_debug("%s:\n", label);
+	pr_debug("%s\n", label);
 	list_for_each_entry(e, l, node) {
 		pr_debug("node %u: %.*s\n", e->idx, (int)e->len, e->word);
 	}
