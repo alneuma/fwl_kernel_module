@@ -161,7 +161,35 @@ The write function stack-allocates a transaction object. Together with the user 
 Both `fwl_transaction_populate_locked()` and `fwl_transaction_commit_locked()` need to be protected by the OFD local mutex, while only for the latter `re_sem_user` needs to be locked for writing.
 
 ### Logging
-### Node indexing
+### The read cursor and node indexing
+
+For an OFD to keep track where in the word queue it has finished its last read operation, words in the queue are indexed and a `struct fwl_cursor` object is saved within the OFD's private data.
+
+```C
+struct fwl_cursor {
+	struct list_head *ptr; /* points to the word node */
+	size_t word_pos; /* remembers the position withing the word */
+	u32 node_idx; /* saves the index of the node */
+};
+```
+
+In most cases an OFD can just continue reading from the queue, where it left. `ptr` directly points to the word node and `word_pos` denotes the offset from the beginning of the word. Once we take into consideration during logging events word nodes can be removed from the beginning of the queue, this gets brittle. What if the exact node the OFD's cursor was pointing to gets removed in between reads? To determine whether a cursor is still valid its saved `node_idx` is compared against the index of the fist node in the queue. A monotonically increasing indexing scheme guarantees, that if the cursor's `node_idx` is smaller than the index of the first node, the node the cursor is pointing to is no longer valid. In this case the cursor can be advanced to the first node of the queue.
+
+#### Things to note about the cursor implementation
+
+There are at least two things worth noting:
+
+##### A different implementation strategy without `ptr`
+
+Restoring the read position works without the node pointer in the cursor struct. The index is enough. At each read, the queue can simply be traversed until the word with the right index is found. The traversal can be done with a maximum of `n / 2`, where `n` is the number of words in the queue: We can check if the saved index is closer to the one of the first node or the last node in the queue and then traverse from the cheapest direction (we do have a doubly linked list). Also the number of nodes is naturally capped by the device's memory limit. Performance differences might only be noticed when there is a large and fully used memory limit and many reads are issued with small buffer sizes.
+An advantage of the index only approach is that there is one less pointer variable per OFD to occupy memory and maybe more importantly, one variable less whose state needs to be tracked.
+
+##### Indices are finite
+
+In the current implementation indices can not be repurposed. This means that there is the possibility of index exhaustion. The total amount words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one second second logging interval, once the device's memory limit has been reached:
+The node of a one byte word occupies `33 bytes` of memory. With a memory limit of `1 GB` this amounts to a maximum of `32537631` words that can be enqueued at the same time. Lets assume all of those get enqueued immediately after the device is loaded. From then on new words can only be enqueued with a frequency of one per second. If we reserve one number as a sentinel, `u32` provides us with a pool of `2^32 - 1 = 4294967295` indices. So there are `4294967295 - 32537631 = 4262429666` seconds, or roughly `135` years left until index exhaustion. If anybody decides to use make use of the device driver in this way `write()` will eventually return `-ENOSPC`.
+There is a book keeping implication: Because a pending word (`stash`) is enqueued when the OFD that owns it is released. An index needs to be reserved for each pending word, if we do not ever want to run into `close()` returning `-ENOSPC`.
+
 ### Memory accounting
 
 ## The most challenging parts

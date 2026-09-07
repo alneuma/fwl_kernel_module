@@ -300,8 +300,9 @@ static void fwl_work_handler(struct work_struct *work)
 /*
  * fwl_word_delim()
  *
- * c == FWL_WORD_SEP is separately checked, in case FWL_WORD_SEP is not
- * within the set defined by isspace().
+ * c == FWL_WORD_SEP is currently redundant, but still separately checked, in
+ * case FWL_WORD_SEP is compiled with a replacement, that is not within the set
+ * defined by isspace().
  */
 static bool fwl_word_delim(char c)
 {
