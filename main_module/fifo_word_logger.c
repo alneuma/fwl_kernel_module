@@ -158,11 +158,9 @@
 
 #define FWL_DRIVER_NAME "fifo_word_logger"
 #define FWL_WORD_SEP ' '
-#define FWL_LOG_INTERVAL (HZ / 100)
+#define FWL_LOG_INTERVAL HZ
 #define FWL_MAX_BUF 1024
 #define FWL_MAX_MEM (1024 * 1024)
-
-#define u32 unsigned char
 
 struct fwl_word {
 	struct list_head node;
