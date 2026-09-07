@@ -12,15 +12,15 @@ Words are received through `write()`, exposed as a byte stream through `read()`,
 
 ## Main challenges
 
-The FIFO itself is simple. The interesting part is making it behave predictably when everything happens at once:
+The data structure itself is simple. The interesting part is making it behave predictably when everything happens at once:
 
-- words can span multiple `write()` calls
-- multiple OFDs can read and write concurrently
-- a single OFD can read and write concurrently
-- the logging mechanism can remove queued words concurrently and between
-- this state mutation can happen between reads
-- allocations and user-space memory accesses can fail
-- resource exhaustion can happen
+- Words can span multiple `write()` calls.
+- Multiple OFDs can read and write concurrently.
+- A single OFD can read and write concurrently.
+- The logging mechanism can remove queued words concurrently and between.
+- This state mutation can happen between reads.
+- Allocations and user-space memory accesses can fail.
+- Resource exhaustion can happen.
 
 ## What I have learned
 
@@ -42,7 +42,7 @@ are haunting me till this day.
 
 #### What is a word?
 
-Words are created from write() buffers. A word is any number of bytes delimited by separators. A separator is any of the following: the zero byte, the FWL_WORD_SEP byte(a compile-time constant), any byte in the set defined by the isspace() function. The first byte written through an OFD is considered to be to the right of a separator. The last byte written through an OFD is considered to be to the left of a separator. Currently FWL_WORD_SEP is defined to be a simple ASCII space. A rather long-winded way of saying, that a word is pretty much what you would expect it to be.
+Words are created from write() buffers. A word is any number of bytes delimited by separators. A separator is any of the following: the zero byte, the FWL_WORD_SEP byte(a compile-time constant), any byte in the set defined by the isspace() function. The first byte written through an OFD is considered to be to the right of a separator. The last byte written through an OFD is considered to be to the left of a separator. Currently FWL_WORD_SEP is defined to be a simple ASCII space. A rather long-winded way of saying that a word is pretty much what you would expect it to be.
 
 #### Preserving word integrity between writes
 
@@ -79,7 +79,7 @@ if FWL_WORD_SEP is a space, then a queue of
 ```
 Hello -- how -- are -- you?
 ```
-Should write
+Should produce
 ```
 "Hello how are you?"
 ```
@@ -116,7 +116,7 @@ If no logging would have happened between reads and the queue was left in its or
 There are at least three ways to deal with this problem in a way that would semantically make sense:
 
 1. Every node removed from the queue is kept in memory until there are no more references from any OFD's read-cursor to it. Read would go on as if the state of the queue was not changed, the words which are already removed form the queue would stay in memory until all OFD's that have started reading some of them, have finished reading all of them.
-2. A variation of 1., where only currently pointed at words are kept in memory after and OFD has finished reading an already dequeued word, its read-cursor would jump to the beginning of the first word of the queue.
+2. A variation of 1., where only currently pointed at words are kept in memory after an OFD has finished reading an already dequeued word, its read-cursor would jump to the beginning of the first word of the queue.
 3. The cursor immediately jumps to the first word of the queue.
 
 For this implementation I went with 3. If an OFD already started reading a removed word, the next read will prepend a separator to mark the beginning of a new word.
@@ -136,7 +136,7 @@ There are a couple of general considerations
 1. Memory is limited
 The amount of memory occupied by the device must be limited. We are in kernel-space, unbound memory consumption can be really bad.
 2. Concurrency is everywhere
-Reads and writes from the same or from different OFDs can happen at any time. As long as the queue is not empty logging and word dequeuing can always interfere with those.
+Reads and writes through the same or from different OFDs can happen at any time. As long as the queue is not empty logging and word dequeuing can always interfere with those.
 3. Everything can fail
 Pretty much the same as in user-space, but it somehow feels more real.
 4. There is no *libc*, we can not use system calls, we provide them. All the help at our disposal comes from the internal Linux kernel API.
@@ -241,7 +241,7 @@ The current strategy for memory accounting is still really rough around the corn
 
 ## Testing
 
-I mainly tested manually by modifying compile-time constants like resource limits and logging interval or by modifying the code to enforce failure paths. To small user-space C programs were specifically to test the module.
+I mainly tested manually by modifying compile-time constants like resource limits and logging interval or by modifying the code to enforce failure paths. Two small user-space C programs were specifically to test the module.
 
 These programs are:
 
@@ -251,6 +251,24 @@ These programs are:
 The kernels KSAN, KMEMLEAK and KLOCKDEP did substantial work 
 
 I have not stress tested the module with multiple concurrent accesses.
+
+### Overview of performed testing duties
+
+| Area | Tested |
+|-|-|
+| Partial words across writes | Yes |
+| Small read() buffers | Yes |
+| Queue mutation during reads | Yes |
+| Memory exhaustion	| Yes |
+| Index exhaustion | Yes |
+| Ran with KASAN | Yes |
+| Ran with KMEMLEAK | Yes |
+| Ran with LOCKDEP | Yes |
+| Allocation failures | partially |
+| Concurrent reads | No |
+| Concurrent writes | No |
+| Concurrent read/write | No |
+| Multiple concurrent OFDs | No |
 
 ## Possible refinements for future iterations
 
