@@ -7,7 +7,8 @@ related prior experience: user space C and basic Linux administration
 
 This implements a small character device driver that reads words into a queue and afterwards logs them to the kernel ring buffer, first in, first out.
 A lot of care has been spend to precisely define its semantics and guarantee correctness under edge cases.
-For development a Linux kernel has been newly compiled, with many debugging features enabled.
+
+All the testing happened in a Debian 13 VM using a freshly compiled kernel with many debugging features enabled.
 
 ## The most challenging parts
 
@@ -107,6 +108,25 @@ For this implementation I went with 3. If an OFD already started reading a remov
 #### error codes etc.
 
 ## Implementation
+
+There are a couple of general considerations
+
+1. Memory is limited
+The amount of memory occupied by the device must be limited. We are in kernel space, unbound memory consumption can be really bad.
+2. Concurrency is everywhere
+Reads and writes from the same or from different OFDs can happen at any time. As long as the queue is not empty logging and word dequeuing can always interfere with those.
+3. Everything can fail
+Pretty much the same as in user space, but it somehow feels more real.
+4. There is no libc, we can not use system calls, we provide them. All the help at our disposal comes from the internal Linux kernel API.
+
+### General concurrency management
+I am using two read/write semaphores for managing shared state, as well as one mutex per OFD to protect per OFD state from concurrent reads or writes. I am using the following lock order:
+
+| lock order | name | function |
+|-|-|-|
+| 1 | `ofd_data.lock` | per OFD mutex |
+| 2 | `rw_sem_log` | read/write semaphore protecting some logging related state changes of the queue |
+| 3 | `rw_sem_user` | read/write semaphore protecting all accesses to device wide shared data, mainly the word queue |
 
 ### Transactions
 ### per OFD state
