@@ -10,11 +10,6 @@ A lot of care has been spend to precisely define its semantics and guarantee cor
 
 All the testing happened in a Debian 13 VM using a freshly compiled kernel with many debugging features enabled.
 
-## The most challenging parts
-
-### define the interrelation between logging and read() semantics
-### Reasoning about concurrency and shared state changes caused by the logger
-
 ## Semantics
 
 ### Words
@@ -133,22 +128,52 @@ Not taking into account data, that is exclusively used by `fwl_init()` and `fwl_
 | name | function |
 |-|-|
 | `word_list` | the word queue |
-| `mem_used` | persistent(!) dynamic memory occupied by the device |
+| `mem_used` | persistent(!) dynamic memory occupied by the device, allocator overhead not taken into account |
 | `node_idx_counter` | counter kept for of indexing queue nodes |
 | `node_idx_num_reserved` | number of reserved queue node indices |
+
+### custom types
+
+| name | function |
+|-|-|
+| `struct fwl_word` | represents words as nodes of the queue |
+| `struct fwl_cursor` | used by read() to represent a position inside of the stream constructed from the word queue |
+| `struct fwl_ofd` | used to store per ofd state: `struct fwl_cursor`, a pointer to a `struct fwl_word` for pending unterminated words from prior writes and a mutex to protect this state from concurrent accesses |
+| `struct fwl_transaction_write` | this is used to prepare and validate data received by write() before it is committed to the device's persistent state |
 
 ### Transactions
 When a write happens, data flows from user space to the device. Many things can go wrong. Before any changes are committed to the device's persistent state. A transaction object is prepared and validated. If any non-recoverable error happens, the transaction object is dropped and the device's persistent state stays untouched. If the transaction is safe to be committed this happens in one atomic event protected by `rw_sem_user`.
 
-### per OFD state
+```C
+/* the transaction type */
+struct fwl_transaction_write {
+	struct list_head words;
+	struct fwl_word *stash;
+	size_t bytes_copied;
+};
+
+/* the most relevant functions */
+static int fwl_transaction_populate_locked();
+static int fwl_transaction_commit_locked();
+```
+
+The write function stack-allocates a transaction object. Together with the user provided buffer, and a possible pending unfinished word from the OFD's private data, this object is then passed to `fwl_transaction_populate_locked()`. Here the whole transaction gets prepared: A word list (`words`) gets created together with a potentially new pending unfinished word (`stash`). If this succeeds, write will call `fwl_transaction_commit_locked()`. Here checks for node index and memory exhaustion are performed. If they succeed the relating shared state are updated, before the indexed list segment is appended to the word queue and the OFD's old `stash` gets replaced by the new one provided by the transaction.
+Both `fwl_transaction_populate_locked()` and `fwl_transaction_commit_locked()` need to be protected by the OFD local mutex, while only for the latter `re_sem_user` needs to be locked for writing.
+
 ### Logging
 ### Node indexing
 ### Memory accounting
 
-## Major points still missing
+## The most challenging parts
 
+### define the interrelation between logging and read() semantics
+### Reasoning about concurrency and shared state changes caused by the logger
+
+## Possible refinements for future iterations
+
+### Add a limit to the word size
 ### Command line configuration during module loading
-- word limits
+- word size limit
 - logging interval
 - memory limit
 ### More elaborate testing setup
