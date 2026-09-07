@@ -56,10 +56,9 @@
  * *** node indexing ***
  * 
  * To determine if a read cursor still points at a valid word node, each word
- * node has a unique index. Indices are represented by an unsigned integer type
- * and are finite. Indexing starts at 1 and 0 is used as a sentinel value. If
- * the next index to assign would be 0. We know that the next_index variable has
- * wrapped around and the pool of indices is exhausted.
+ * node has a unique index. Indices are represented by an unsigned integer type,
+ * are finite and can not be reused. Indexing starts at 1. If assigning a next
+ * index during write() would overflow the index counter, -ENOSPC is returned.
  *
  * *** memory limits ***
  * 
@@ -137,7 +136,8 @@
  * 2. rw_sem_logging
  * 3. rw_sem_user
  */
-#define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+// #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
+#define pr_fmt(fmt) "%s: " fmt, "fwl"
 
 #include <linux/cdev.h>
 #include <linux/ctype.h>
@@ -194,16 +194,20 @@ static struct cdev fifo_word_logger;
 static struct class *cls;
 static LIST_HEAD(word_list);
 static struct delayed_work fwl_work;
-static u32 next_node_idx = 1;
+static u32 node_idx_counter = 0;
+static u32 node_idx_num_reserved = 0;
 static size_t mem_used = 0;
 
 /*
  * debugging functions
  */
+#ifdef DEBUG
+static void fwl_counters_log(const char *label);
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label);
 static void fwl_list_log(const struct list_head *l, const char *label);
 static void fwl_transaction_log(const struct fwl_transaction_write *t,
 				const char *label);
+#endif
 
 static size_t fwl_word_size(const struct fwl_word *word)
 {
@@ -243,7 +247,7 @@ static bool fwl_consume_first_word(struct list_head *words)
 	up_write(&rw_sem_logging);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
-	pr_info("%.*s\n", len, e->word);
+	pr_info("log %u: %.*s\n", e->idx, len, e->word);
 	kfree(e);
 
 	return keep_going;
@@ -342,7 +346,7 @@ static int fwl_word_make(struct fwl_word **new_word, const char *prefix,
 	size_t len;
 	size_t size;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (!prefix && prefix_len)
 		return -EINVAL;
@@ -384,7 +388,7 @@ static int fwl_transaction_update(struct fwl_transaction_write *trans,
 	size_t wstart = 0;
 	struct fwl_word *new_word = NULL;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (old_stash) {
 		while (idx < buf_size && !fwl_word_delim(buf[idx]))
@@ -488,6 +492,32 @@ done:
 }
 
 /*
+ * fwl_node_idx_reserved_update()
+ *
+ * Subtraction would only overflow if node_idx_num_reserved == 0.
+ * But this can not be the case if old_stash != NULL.
+ */
+static int fwl_node_idx_reserved_update(u32 *new_reserved, u32 old_reserved,
+					const struct fwl_word *old_stash,
+					const struct fwl_word *new_stash)
+{
+	u32 dummy;
+
+	*new_reserved = old_reserved;
+	if (old_stash && !new_stash)
+		*new_reserved -= 1;
+	else if (!old_stash && new_stash) {
+		if (check_add_overflow(old_reserved, 1, new_reserved))
+			return -ENOSPC;
+	}
+
+	if (check_add_overflow(*new_reserved, node_idx_counter, &dummy))
+		return -ENOSPC;
+
+	return 0;
+}
+
+/*
  * fwl_transaction_update_counters_locked()
  *
  * Assigns indices to transaction list and updates total memory usage.
@@ -506,36 +536,46 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 				       struct fwl_ofd *ofd_data)
 {
 	struct fwl_word *e;
-	size_t new_mem_used = 0;
-	u32 tmp_idx = next_node_idx;
+	size_t tmp_mem_used = 0;
+	u32 tmp_idx = node_idx_counter;
+	u32 tmp_idx_reserved;
+	u32 dummy;
 
 	lockdep_assert_held(&ofd_data->lock);
 	lockdep_assert_held_write(&rw_sem_user);
 
+	if (fwl_node_idx_reserved_update(&tmp_idx_reserved,
+					 node_idx_num_reserved, ofd_data->stash,
+					 trans->stash))
+		return -ENOSPC;
+
 	if (trans->stash)
-		new_mem_used = fwl_word_size(trans->stash);
+		tmp_mem_used = fwl_word_size(trans->stash);
 
 	list_for_each_entry(e, &trans->words, node) {
-		if (!tmp_idx)
+		if (check_add_overflow(tmp_idx, 1, &e->idx))
 			return -ENOSPC;
-		if (check_add_overflow(new_mem_used, fwl_word_size(e),
-				       &new_mem_used))
+		++tmp_idx;
+		if (check_add_overflow(tmp_idx, tmp_idx_reserved, &dummy))
+			return -ENOSPC;
+		if (check_add_overflow(tmp_mem_used, fwl_word_size(e),
+				       &tmp_mem_used))
 			return -EOVERFLOW;
-		e->idx = tmp_idx++;
 	}
 
 	/* no need to check overflow, see note */
 	if (ofd_data->stash)
-		new_mem_used -= fwl_word_size(ofd_data->stash);
+		tmp_mem_used -= fwl_word_size(ofd_data->stash);
 
-	if (check_add_overflow(mem_used, new_mem_used, &new_mem_used))
+	if (check_add_overflow(mem_used, tmp_mem_used, &tmp_mem_used))
 		return -EOVERFLOW;
 
-	if (new_mem_used > FWL_MAX_MEM)
+	if (tmp_mem_used > FWL_MAX_MEM)
 		return -ENOSPC;
 
-	next_node_idx = tmp_idx;
-	mem_used = new_mem_used;
+	node_idx_num_reserved = tmp_idx_reserved;
+	node_idx_counter = tmp_idx;
+	mem_used = tmp_mem_used;
 
 	return 0;
 }
@@ -561,6 +601,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	lockdep_assert_held(&rw_sem_user);
 
 	ret = fwl_transaction_update_counters_locked(trans, ofd_data);
+
 	if (ret)
 		return ret;
 
@@ -574,8 +615,6 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	trans->stash = NULL;
 
 	*copied = trans->bytes_copied;
-
-	pr_debug("mem_used: %zu\n", mem_used);
 
 	return 0;
 }
@@ -594,8 +633,6 @@ static void fwl_transaction_clear(struct fwl_transaction_write *trans)
 /*
  * fwl_open()
  * initialized per ofd data
- * TODO: consider reserving an index when opening, such that closing can never
- * return -ENOSPC. The current version is slightly awkward.
  */
 static int fwl_open(struct inode *inode, struct file *filp)
 {
@@ -603,7 +640,7 @@ static int fwl_open(struct inode *inode, struct file *filp)
 	size_t mem_tmp = 0;
 	int ret = 0;
 
-	pr_debug("called\n");
+	pr_debug("---- open() ----\n");
 
 	ofd_data = kzalloc(sizeof(*ofd_data), GFP_KERNEL);
 	if (!ofd_data)
@@ -629,9 +666,7 @@ static int fwl_open(struct inode *inode, struct file *filp)
 
 /*
  * fwl_release()
- * cleans up and commits any unfinished words from per ofd_data->stash to list
- * TODO: consider reserving an index when opening, such that closing can never
- * return -ENOSPC. The current version is slightly awkward.
+ * If there was a stash, a node index was reserved before.
  */
 static int fwl_release(struct inode *inode, struct file *filp)
 {
@@ -640,26 +675,21 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	ofd_data->stash = NULL;
 	bool should_log = false;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (stash) {
 		down_write(&rw_sem_user);
 
-		if (!next_node_idx) {
-			mem_used -= sizeof(struct fwl_ofd);
-			mem_used -= fwl_word_size(stash);
-			up_write(&rw_sem_user);
-			kfree(stash);
-			kfree(filp->private_data);
-			return -ENOSPC;
-		}
-		stash->idx = next_node_idx++;
+		stash->idx = ++node_idx_counter;
+		--node_idx_num_reserved;
 
 		should_log = list_empty(&word_list);
 
 		list_add_tail(&stash->node, &word_list);
+		stash = NULL;
 
 		up_write(&rw_sem_user);
+
 		if (should_log)
 			(void)schedule_delayed_work(&fwl_work,
 						    FWL_LOG_INTERVAL);
@@ -716,7 +746,7 @@ static ssize_t fwl_write(struct file *filp, const char __user *buf,
 	bool should_log = false;
 	int ret = 0;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (!count)
 		return 0;
@@ -747,8 +777,7 @@ done:
 
 	if (ret)
 		fwl_transaction_clear(&trans);
-
-	if (should_log)
+	else if (should_log)
 		(void)schedule_delayed_work(&fwl_work, FWL_LOG_INTERVAL);
 
 	return ret ? ret : copied;
@@ -934,7 +963,7 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 
 	(void)f_pos;
 
-	pr_debug("called\n");
+	//pr_debug("called\n");
 
 	if (!count)
 		return 0;
@@ -1048,29 +1077,34 @@ MODULE_DESCRIPTION("character device experiment using a list");
 /*
  * debugging functions
  */
+#ifdef DEBUG
+static void fwl_counters_log(const char *label)
+{
+	pr_debug("%s\n", label);
+	pr_debug("node_idx_counter = %u\n", node_idx_counter);
+	pr_debug("node_idx_num_reserved = %u\n", node_idx_num_reserved);
+	pr_debug("mem_used: %zu\n", mem_used);
+}
 static void fwl_transaction_log(const struct fwl_transaction_write *t,
 				const char *label)
 {
-	pr_debug("%s:\n", label);
-
+	pr_debug("%s\n", label);
 	pr_debug("t->stash = %p\n", t->stash);
 	pr_debug("t->bytes_copied = %zu\n", t->bytes_copied);
 }
-
 static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 {
-	pr_debug("%s:\n", label);
+	pr_debug("%s\n", label);
 	pr_debug("ptr = %p\n", c->ptr);
 	pr_debug("word_pos = %zu\n", c->word_pos);
 	pr_debug("node_idx = %u\n", c->node_idx);
 }
-
 static void fwl_list_log(const struct list_head *l, const char *label)
 {
 	struct fwl_word *e;
-
-	pr_debug("%s:\n", label);
+	pr_debug("%s\n", label);
 	list_for_each_entry(e, l, node) {
 		pr_debug("node %u: %.*s\n", e->idx, (int)e->len, e->word);
 	}
 }
+#endif
