@@ -161,6 +161,26 @@ The write function stack-allocates a transaction object. Together with the user 
 Both `fwl_transaction_populate_locked()` and `fwl_transaction_commit_locked()` need to be protected by the OFD local mutex, while only for the latter `re_sem_user` needs to be locked for writing.
 
 ### Logging
+
+Logging is implemented with by with self rescheduling work items with and a single callback function.
+
+#### Two states
+There are two relevant states: `queue empty` and `queue non-empty`.
+
+##### queue empty
+As long as the queue is empty, no new work items are scheduled. If the callback function is currently executing, then it has already reached a state in which it has determined that it wont self-reschedule.
+
+##### queue non-empty
+When the queue is non-empty a work item is already scheduled or about to be scheduled. The periodically (1 second intervals) executed callback function deletes the first word in the queue and then reschedule the work item if `queue non-empyty` still persists. Timer drift is prevented by the callback function calculating the ideal execution time of the next callback relative to the ideal execution time of the current. The ideal execution time then is compared to the current time to determine for how many `jiffies` in the future the next callback should be scheduled.
+
+##### transitions
+
+Every transition from `queue empty` to `queue non-empty` happens atomically and is fully controlled by `write()` and `release()`. The atomicity ensures, that no scheduling contest happens.
+
+Every transition from `queue non-empty` to `queue empty` also happens atomically and is fully controlled by the callback.
+
+Because `read()` temporarily releases `rw_sem_user` when copying from its internal buffer to the user's read buffer. There is a possibility, that the callback removes a word from the queue during this time. Under certain edge cases this could invalidate the read cursor. To prevent this `rw_sem_logging` is used. As logging only happens once a second there should be only little lock contention.
+
 ### The read cursor and node indexing
 
 For an OFD to keep track where in the word queue it has finished its last read operation, words in the queue are indexed and a `struct fwl_cursor` object is saved within the OFD's private data.
@@ -177,20 +197,20 @@ In most cases an OFD can just continue reading from the queue, where it left. `p
 
 #### Things to note about the cursor implementation
 
-There are at least two things worth noting:
-
-##### A different implementation strategy without `ptr`
-
-Restoring the read position works without the node pointer in the cursor struct. The index is enough. At each read, the queue can simply be traversed until the word with the right index is found. The traversal can be done with a maximum of `n / 2`, where `n` is the number of words in the queue: We can check if the saved index is closer to the one of the first node or the last node in the queue and then traverse from the cheapest direction (we do have a doubly linked list). Also the number of nodes is naturally capped by the device's memory limit. Performance differences might only be noticed when there is a large and fully used memory limit and many reads are issued with small buffer sizes.
-An advantage of the index only approach is that there is one less pointer variable per OFD to occupy memory and maybe more importantly, one variable less whose state needs to be tracked.
-
 ##### Indices are finite
 
 In the current implementation indices can not be repurposed. This means that there is the possibility of index exhaustion. The total amount words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one second second logging interval, once the device's memory limit has been reached:
 The node of a one byte word occupies `33 bytes` of memory. With a memory limit of `1 GB` this amounts to a maximum of `32537631` words that can be enqueued at the same time. Lets assume all of those get enqueued immediately after the device is loaded. From then on new words can only be enqueued with a frequency of one per second. If we reserve one number as a sentinel, `u32` provides us with a pool of `2^32 - 1 = 4294967295` indices. So there are `4294967295 - 32537631 = 4262429666` seconds, or roughly `135` years left until index exhaustion. If anybody decides to use make use of the device driver in this way `write()` will eventually return `-ENOSPC`.
 There is a book keeping implication: Because a pending word (`stash`) is enqueued when the OFD that owns it is released. An index needs to be reserved for each pending word, if we do not ever want to run into `close()` returning `-ENOSPC`.
 
+##### A different implementation strategy without `ptr`
+
+Restoring the read position works without the node pointer in the cursor struct. The index is enough. At each read, the queue can simply be traversed until the word with the right index is found. The traversal can be done with a maximum of `n / 2`, where `n` is the number of words in the queue: We can check if the saved index is closer to the one of the first node or the last node in the queue and then traverse from the cheapest direction (we do have a doubly linked list). Also the number of nodes is naturally capped by the device's memory limit. Performance differences might only be noticed when there is a large and fully used memory limit and many reads are issued with small buffer sizes.
+An advantage of the index only approach is that there is one less pointer variable per OFD to occupy memory and maybe more importantly, one variable less whose state needs to be tracked.
+
 ### Memory accounting
+
+The current strategy for memory accounting is still really rough around the corners. There is a device wide memory limit to dynamic memory usage only for persistent state, i.e. queue nodes and per OFD state. Transiently used memory which for e.g. could accumulate during many concurrent `write()` calls is not limited yet. To make things worse allocator overhead is not taken into account when calculation currently occupied memory. This should be one of the first things to be reworked during future iterations.
 
 ## The most challenging parts
 
