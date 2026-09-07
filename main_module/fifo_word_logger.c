@@ -678,7 +678,6 @@ static int fwl_release(struct inode *inode, struct file *filp)
 	//pr_debug("called\n");
 
 	if (stash) {
-
 		down_write(&rw_sem_user);
 
 		stash->idx = ++node_idx_counter;
@@ -1101,7 +1100,6 @@ static void fwl_cursor_log(const struct fwl_cursor *c, const char *label)
 static void fwl_list_log(const struct list_head *l, const char *label)
 {
 	struct fwl_word *e;
-
 	pr_debug("%s\n", label);
 	list_for_each_entry(e, l, node) {
 		pr_debug("node %u: %.*s\n", e->idx, (int)e->len, e->word);
