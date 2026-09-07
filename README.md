@@ -4,12 +4,8 @@
 ## Overview
 
 Write words into the device, read them back, log them one by one. What could possibly go wrong?
-A Linux kernel character device that accepts a byte stream, reconstructs words across write() calls, exposes the queue through read(), and asynchronously logs/dequeues one word per second.
-The interesting part isn't the queue. It's making all of that well-defined when multiple OFDs access it concurrently, asynchronous logging mutates the queue, allocations fail, resources get exhausted and readers can hold positions into state that disappears underneath them.
-
-> **Kernel:** Linux 6.12.105\
-> **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
-> **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation and testing
+FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words. It is designed to support concurrent readers and writers, preserves words across write() calls, and asynchronously dequeues and logs one word per second.
+The queue itself is trivial. The interesting part is defining what happens when concurrent operations, asynchronous state mutation, allocation failures and resource exhaustion can all happen at once.
 
 ## Main challenges
 
@@ -18,25 +14,24 @@ The data structure itself is simple. The interesting part is making it behave pr
 - Words can span multiple `write()` calls.
 - Multiple OFDs can read and write concurrently.
 - A single OFD can read and write concurrently.
-- The logging mechanism can remove queued words concurrently and between.
-- This state mutation can happen between reads.
+- The logging mechanism can remove queued words concurrently and between reads.
 - Allocations and user-space memory accesses can fail.
 - Resource exhaustion can happen.
 
-## Technical Highlights
+## What this demonstrates
 
-- per-OFD state
-- asynchronous mutation of shared state
-- failure-atomic writes
-- bounded persistent memory
-- well defined behavior under concurrent reads, writes, and queue mutation.
+- Linux kernel module development in C
+- Concurrent shared-state design
+- Per-open-file-description (OFD) state management
+- Failure-atomic mutation of persistent state
+- Explicit resource accounting and exhaustion handling
+- Asynchronous workqueue-driven state mutation
+- Reasoning about object lifetime and stale references
+- Kernel debugging and concurrency tooling
 
 ## What I have learned
 
-Although I have experience with user-space C and am no stranger to Linux, this was my first venture into kernel-space.
-
-I initially expected the setup of the development environment to be the most challenging part of the project. I was dead wrong.
-Learning to think in kernel terms, constantly reasoning about concurrency, state, ownership and edge cases, proved to be substantially more challenging than any VM setup or kernel compilation could ever be. Questions like
+I came into this with some background in user-space C and Linux, but had never touched the kernel. The hardest part wasn't learning the API or setting up the development environment, it was learning to reason about execution contexts, concurrency, ownership, and object lifetime. Questions like:
 
 - What happens when another execution context removes an object I am referencing?
 - How can a multi-stage operation fail without corrupting persistent state?
@@ -44,6 +39,14 @@ Learning to think in kernel terms, constantly reasoning about concurrency, state
 - How should resource limits interact with object lifetime and error handling?
 
 are haunting me till this day.
+
+## Design overview
+
+- Per-OFD state is protected by an OFD-local mutex.
+- Device-wide state is protected by two rw-semaphores with a defined lock order.
+- Writes use a transaction object to prepare mutations before committing them.
+- A self-rescheduling work item asynchronously removes and logs one word per second.
+- Read cursors use monotonically increasing node indices to detect invalidated references.
 
 ## Semantics
 
@@ -294,3 +297,9 @@ I have not stress tested the module with multiple concurrent accesses.
 - clarifying unfamiliar APIs/concepts
 - reviewing already-written code
 - exploring potential failure cases
+
+> **Kernel:** Linux 6.12.105\
+> **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
+> **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation and testing
+
+Each open() creates an open file description (OFD), and the driver associates private state with that OFD via file->private_data. Multiple file descriptors may reference the same OFD after dup()/fork().
