@@ -684,8 +684,10 @@ static int fwl_release(struct inode *inode, struct file *filp)
 		should_log = list_empty(&word_list);
 
 		list_add_tail(&stash->node, &word_list);
+		stash = NULL;
 
 		up_write(&rw_sem_user);
+
 
 		if (should_log)
 			(void)schedule_delayed_work(&fwl_work,
