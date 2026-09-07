@@ -536,7 +536,9 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 	lockdep_assert_held(&ofd_data->lock);
 	lockdep_assert_held_write(&rw_sem_user);
 
-	if (fwl_node_idx_reserved_update(&tmp_idx_reserved, node_idx_num_reserved, ofd_data->stash, trans->stash))
+	if (fwl_node_idx_reserved_update(&tmp_idx_reserved,
+					 node_idx_num_reserved, ofd_data->stash,
+					 trans->stash))
 		return -ENOSPC;
 
 	if (trans->stash)
