@@ -490,6 +490,9 @@ done:
 
 /*
  * fwl_node_idx_reserved_update()
+ *
+ * Subtraction would only overflow if node_idx_num_reserved == 0.
+ * But this can not be the case if old_stash != NULL.
  */
 static int fwl_node_idx_reserved_update(u32 *new_reserved, u32 old_reserved,
 					const struct fwl_word *old_stash,
@@ -525,37 +528,44 @@ fwl_transaction_update_counters_locked(struct fwl_transaction_write *trans,
 				       struct fwl_ofd *ofd_data)
 {
 	struct fwl_word *e;
-	size_t new_mem_used = 0;
+	size_t tmp_mem_used = 0;
 	u32 tmp_idx = node_idx_next;
-	u32 tmp_reserved = node_idx_num_reserved;
+	u32 tmp_idx_reserved;
+	u32 dummy;
 
 	lockdep_assert_held(&ofd_data->lock);
 	lockdep_assert_held_write(&rw_sem_user);
 
+	if (fwl_node_idx_reserved_update(&tmp_idx_reserved, node_idx_num_reserved, ofd_data->stash, trans->stash))
+		return -ENOSPC;
+
 	if (trans->stash)
-		new_mem_used = fwl_word_size(trans->stash);
+		tmp_mem_used = fwl_word_size(trans->stash);
 
 	list_for_each_entry(e, &trans->words, node) {
-		if (!tmp_idx)
+		if (check_add_overflow(tmp_idx, 1, &e->idx))
 			return -ENOSPC;
-		if (check_add_overflow(new_mem_used, fwl_word_size(e),
-				       &new_mem_used))
+		++tmp_idx;
+		if (check_add_overflow(tmp_idx, tmp_idx_reserved, &dummy))
+			return -ENOSPC;
+		if (check_add_overflow(tmp_mem_used, fwl_word_size(e),
+				       &tmp_mem_used))
 			return -EOVERFLOW;
-		e->idx = tmp_idx++;
 	}
 
 	/* no need to check overflow, see note */
 	if (ofd_data->stash)
-		new_mem_used -= fwl_word_size(ofd_data->stash);
+		tmp_mem_used -= fwl_word_size(ofd_data->stash);
 
-	if (check_add_overflow(mem_used, new_mem_used, &new_mem_used))
+	if (check_add_overflow(mem_used, tmp_mem_used, &tmp_mem_used))
 		return -EOVERFLOW;
 
-	if (new_mem_used > FWL_MAX_MEM)
+	if (tmp_mem_used > FWL_MAX_MEM)
 		return -ENOSPC;
 
-	next_node_idx = tmp_idx;
-	mem_used = new_mem_used;
+	node_idx_num_reserved = tmp_idx_reserved;
+	node_idx_next = tmp_idx;
+	mem_used = tmp_mem_used;
 
 	return 0;
 }
