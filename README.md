@@ -51,11 +51,60 @@ The only permissible outcome is two words `Hello` and `Goodbye` in any order. Wh
 All of this points us at the necessity of keeping per OFD state of unterminated words between writes.
 
 #### Stream construction for read()
+
+read() should return some representation of the current content of the queue. A simple solution is to construct a stream of queue entries separated by FWL_WORD_SEP.
+if FWL_WORD_SEP is a space, then a queue of
+```
+Hello -- how -- are -- you?
+```
+Should write
+```
+"Hello how are you?"
+```
+to the read buffer.
+
 #### Keeping track of read position
 
+Because there is no guarantee that the whole stream can be passed with one single call to read(). Because of this per OFD state needs to be saved to keep track of the position of cursor position between calls to read(). This becomes more complicated once we take into account that between reads new words can be appended with write() or, even worse, words from the beginning of the queue can be removed during logging.
+
 ### Logging
+
+When the queue's state switches from *empty* to *non-empty*, one second later, the first word of the queue is logged and removed from the queue. From then on logging repeats every second. This stops, once the last word is removed from the queue. We can think of two separate states:
+
+*queue is empty*        -> no logging happens
+*queue is non-empty*    -> logging and dequeuing words happens once a second
+
 #### Interaction with read()
-#### read() adjusting its position in the stream when position got invalidated
+
+Let's imagine a scenario where we have a non-empty queue:
+```
+Hello -- how -- are -- you?
+```
+The following happens:
+```
+read of size 4 -> returns "Hell"
+read of size 4 -> returns "o ho"
+logging, removes "Hello"
+logging, removes "how"
+logging, removes "are"
+read of size 4 -> ?
+```
+If no logging would have happened between reads and the queue was left in its original state, we would expect the final read to return `w ar`. But the removal of words has invalidated the read-cursor's position. `how` and `are` are no longer in the queue.
+
+There are at least three ways to deal with this problem in a way that would semantically make sense:
+
+1. Every node removed from the queue is kept in memory until there are no more references from any OFD's read-cursor to it. Read would go on as if the state of the queue was not changed, the words which are already removed form the queue would stay in memory until all OFD's that have started reading some of them, have finished reading all of them.
+2. A variation of 1., where only currently pointed at words are kept in memory after and OFD has finished reading an already dequeued word, its read-cursor would jump to the beginning of the first word of the queue.
+3. The cursor immediately jumps to the first word of the queue.
+
+For this implementation I went with 3. If an OFD already started reading a removed word, the next read will prepend a separator to mark the beginning of a new word.
+```
+? = " you"
+```
+
+### Some less interesting details
+
+#### error codes etc.
 
 ## Implementation
 
