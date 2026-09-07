@@ -501,6 +501,8 @@ static int fwl_node_idx_reserved_update(u32 *new_reserved, u32 old_reserved,
 					const struct fwl_word *old_stash,
 					const struct fwl_word *new_stash)
 {
+	u32 dummy;
+
 	*new_reserved = old_reserved;
 	if (old_stash && !new_stash)
 		*new_reserved -= 1;
@@ -508,6 +510,9 @@ static int fwl_node_idx_reserved_update(u32 *new_reserved, u32 old_reserved,
 		if (check_add_overflow(old_reserved, 1, new_reserved))
 			return -ENOSPC;
 	}
+
+	if (check_add_overflow(*new_reserved, node_idx_counter, &dummy))
+		return -ENOSPC;
 
 	return 0;
 }
@@ -595,9 +600,7 @@ static int fwl_transaction_commit_locked(struct fwl_transaction_write *trans,
 	lockdep_assert_held(&ofd_data->lock);
 	lockdep_assert_held(&rw_sem_user);
 
-	fwl_counters_log("---- before ----");
 	ret = fwl_transaction_update_counters_locked(trans, ofd_data);
-	fwl_counters_log("---- after ----");
 
 	if (ret)
 		return ret;
