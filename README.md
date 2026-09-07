@@ -117,18 +117,29 @@ The amount of memory occupied by the device must be limited. We are in kernel sp
 Reads and writes from the same or from different OFDs can happen at any time. As long as the queue is not empty logging and word dequeuing can always interfere with those.
 3. Everything can fail
 Pretty much the same as in user space, but it somehow feels more real.
-4. There is no libc, we can not use system calls, we provide them. All the help at our disposal comes from the internal Linux kernel API.
+4. There is no *libc*, we can not use system calls, we provide them. All the help at our disposal comes from the internal Linux kernel API.
 
-### General concurrency management
-I am using two read/write semaphores for managing shared state, as well as one mutex per OFD to protect per OFD state from concurrent reads or writes. I am using the following lock order:
+### General locking scheme
+I am using two read/write semaphores for managing shared state, as well as one mutex per OFD to protect per OFD state from concurrent reads or writes. Here is an overview:
 
 | lock order | name | function |
 |-|-|-|
-| 1 | `ofd_data.lock` | per OFD mutex |
-| 2 | `rw_sem_log` | read/write semaphore protecting some logging related state changes of the queue |
-| 3 | `rw_sem_user` | read/write semaphore protecting all accesses to device wide shared data, mainly the word queue |
+| 1 | `ofd_data.lock` | OFD private mutex protecting OFD state from concurrent accesses through the same OFD |
+| 2 | `rw_sem_logging` | read/write semaphore protecting device wide shared data in situations where the only disrupting interfearance to readers could come from the word logging and dequeuing mechanism |
+| 3 | `rw_sem_user` | read/write semaphore protecting all accesses to device wide shared data. It is called `*_user` because these accesses typically happen when data is transferred from or to user space. An exception to this is when the first word gets dequeued during a logging event. |
+
+Not taking into account data, that is exclusively used by `fwl_init()` and `fwl_exit()`, the following device wide shared variables exist:
+
+| name | function |
+|-|-|
+| `word_list` | the word queue |
+| `mem_used` | persistent(!) dynamic memory occupied by the device |
+| `node_idx_counter` | counter kept for of indexing queue nodes |
+| `node_idx_num_reserved` | number of reserved queue node indices |
 
 ### Transactions
+When a write happens, data flows from user space to the device. Many things can go wrong. Before any changes are committed to the device's persistent state. A transaction object is prepared and validated. If any non-recoverable error happens, the transaction object is dropped and the device's persistent state stays untouched. If the transaction is safe to be committed this happens in one atomic event protected by `rw_sem_user`.
+
 ### per OFD state
 ### Logging
 ### Node indexing
