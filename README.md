@@ -1,33 +1,32 @@
 # FWL - FIFO Word Logger
-*A dynamically loadable character device for the Linux kernel*
+*A dynamically loadable character device for the Linux kernel 6.12.105*
 
 ## Overview
 
 Write words into the device, read them back, log them one by one. What could possibly go wrong?
-FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words. It is designed to support concurrent readers and writers, preserves words across write() calls, and asynchronously dequeues and logs one word per second.
-The queue itself is trivial. The interesting part is defining what happens when concurrent operations, asynchronous state mutation, allocation failures and resource exhaustion can all happen at once.
+FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words.
 
-## Main challenges
+## Why is this interesting?
 
-The data structure itself is simple. The interesting part is making it behave predictably when everything happens at once:
+What sounds simple at the surface turns out to come with a lot of decisions concerning architecture and semantics:
 
-- Words can span multiple `write()` calls.
-- Multiple OFDs can read and write concurrently.
-- A single OFD can read and write concurrently.
-- The logging mechanism can remove queued words concurrently and between reads.
-- Allocations and user-space memory accesses can fail.
-- Resource exhaustion can happen.
+What happens when a write stops in the middle of a word?
+What happens when different reads/writes happen concurrently?
+What happens when different reads/writes of the same OFD (open file description) happen concurrently?
+What happens when an OFD reads and its last read ended within a word that now is dequeued?
+How to handle partially successful reads/writes?
+What happens under different failure conditions?
+How to manage resource limits?
 
 ## What this demonstrates
 
 - Linux kernel module development in C
 - Concurrent shared-state design
-- Per-open-file-description (OFD) state management
-- Failure-atomic mutation of persistent state
-- Explicit resource accounting and exhaustion handling
-- Asynchronous workqueue-driven state mutation
+- Per-OFD state management
+- Atomic changes to persistent state
+- Resource accounting and exhaustion handling
+- Asynchronous state changes through work queues
 - Reasoning about object lifetime and stale references
-- Kernel debugging and concurrency tooling
 
 ## What I have learned
 
@@ -40,23 +39,44 @@ I came into this with some background in user-space C and Linux, but had never t
 
 are haunting me till this day.
 
-## Design overview
+## Architecture overview
 
+The central data structure is a queue of words implemented as a list. Writing to the device appends words to this queue. Reading from the device returns the current content of the queue. For this purpose the content is formatted as a stream of words separated by single byte separators. As long as there are enqueued words, once a second a callback removes the first word from the queue and logs it. There are five execution contexts contending for shared state:
+
+| Context | Accesses |
+|-|-|
+| `open()` | Access device wide memory accounting while attempting to allocate memory for per-OFD data |
+| `read()` | Read the queue |
+| `write()` | Write to the queue and access device wide memory accounting when attempting to commit changes to it |
+| `release()` | Access device wide memory accounting. Also might write potentially unfinished words to the queue. |
+| `work_handler()` | The callback, writes to the queue, i.e. removes words. Also accesses device wide memory accounting. |
+
+- To account for read position and unfinished words OFDs save their per-OFD state between accesses.
+- To keep track of read position a `struct cursor` is employed, that references word nodes and whose validity can be verified by a node indexing system.
 - Per-OFD state is protected by an OFD-local mutex.
-- Device-wide state is protected by two rw-semaphores with a defined lock order.
-- Writes use a transaction object to prepare mutations before committing them.
-- A self-rescheduling work item asynchronously removes and logs one word per second.
-- Read cursors use monotonically increasing node indices to detect invalidated references.
+- Device-wide state is protected by two rw-semaphores, separating reads from writes to keep lock contention minimal.
+- Changes to the queue through write are first created and validated within a transaction object, before they atomically get committed to the queue.
+- A self-rescheduling work item once per second asynchronously removes words from the queue and logs them.
 
 ## Semantics
+
+What is a word and how do you want it? Defining precise semantics proved to be much more challenging than I initially expected.
 
 ### Words
 
 #### What is a word?
 
-Words are created from write() buffers. A word is any number of bytes delimited by separators. A separator is any of the following: the zero byte, the FWL_WORD_SEP byte(a compile-time constant), any byte in the set defined by the isspace() function. The first byte written through an OFD is considered to be to the right of a separator. The last byte written through an OFD is considered to be to the left of a separator. Currently FWL_WORD_SEP is defined to be a simple ASCII space. A rather long-winded way of saying that a word is pretty much what you would expect it to be.
+A word is any number of bytes delimited by separators.
+A separator is any of the following:
+- the zero byte
+- the FWL_WORD_SEP byte, a compile-time constant, currently a space
+- any byte in the set defined by the isspace() function
+The first byte written through an OFD is considered to be preceded by a separator.
+The last byte written through an OFD, before release() gets called is considered to be followed by a separator.
 
-#### Preserving word integrity between writes
+All in all, a rather long-winded way of saying that a word is pretty much exactly what you would expect it to be.
+
+#### What if a word spans across multiple writes?
 
 Let's imagine we have this:
 ```C
@@ -64,9 +84,9 @@ write(device_fd, "Hel", 3);
 write(device_fd, "lo", 2);
 close(device_fd);
 ```
-What we want to get is one word `Hello` not two words `Hel` and `lo`.
+What we want is one word, `Hello`, not two words, `Hel` and `lo`.
 
-Now let's imagine that we have two threads with separately opened OFDs writing concurrently:
+Now let's imagine that we have two threads referencing two different OFDs, writing concurrently:
 ```C
 /* Thread A */
 int device_fd_a = open(...);
@@ -80,14 +100,13 @@ write(device_fd_b, "Goo", 3);
 write(device_fd_b, "dbye", 4);
 close(device_fd_b);
 ```
-The only permissible outcome is two words `Hello` and `Goodbye` in any order. What is not permissible are abominations like `Heldbye` or `Goolo` or even much more terrible things like `loGoo` or `GooHel`.
+The only permissible outcome is two words `Hello` and `Goodbye` in any order. What is not permissible are abominations like `Heldbye` or `Goolo` or even more terrible things like `loGoo` or `GooHel`.
 
-All of this points us at the necessity of keeping per-OFD state of unterminated words between writes.
+This is semantics, but it already points us at an important aspect of the implementation: There needs to be per-OFD state, remembering pending words.
 
-#### Stream construction for read()
+#### Stream construction for read() or "How does this look like?"
 
-read() should return some representation of the current content of the queue. A simple solution is to construct a stream of queue entries separated by FWL_WORD_SEP.
-if FWL_WORD_SEP is a space, then a queue of
+Read returns a representation of the current content of the queue. I simply construct a stream of the queues words separated by FWL_WORD_SEP (i.e. space):
 ```
 Hello -- how -- are -- you?
 ```
@@ -97,24 +116,24 @@ Should produce
 ```
 to the read buffer.
 
-#### Keeping track of read position
+As there is no guarantee that the whole stream can be consumed by a single call to read(), this hints at another implementation detail: More per-OFD state is required to keep track of a readers position.
 
-Because there is no guarantee that the whole stream can be passed with one single call to read(). Because of this per-OFD state needs to be saved to keep track of the position of cursor position between calls to read(). This becomes more complicated once we take into account that between reads new words can be appended with write() or, even worse, words from the beginning of the queue can be removed during logging.
+#### Logging
 
-### Logging
+When the queue's state switches from *empty* to *non-empty*, one second later, the first word of the queue is logged and removed from the queue. From then on logging repeats every second. This stops, once the last word is removed from the queue. We can think of two separate states with different device behavior associated.
 
-When the queue's state switches from *empty* to *non-empty*, one second later, the first word of the queue is logged and removed from the queue. From then on logging repeats every second. This stops, once the last word is removed from the queue. We can think of two separate states:
+| state | behavior |
+|-|-|
+| *queue is empty* | no logging happens |
+| *queue is non-empty* | logging and dequeuing words happens once a second |
 
-*queue is empty*        -> no logging happens
-*queue is non-empty*    -> logging and dequeuing words happens once a second
+#### The tricky part: How to make friends of logging and read()?
 
-#### Interaction with read()
-
-Let's imagine a scenario where we have a non-empty queue:
+Let's imagine a scenario where we have a non-empty queue, so logging is active.
 ```
 Hello -- how -- are -- you?
 ```
-The following happens:
+One reader joins in and the following scenario unfolds:
 ```
 read of size 4 -> returns "Hell"
 read of size 4 -> returns "o ho"
@@ -127,19 +146,29 @@ If no logging would have happened between reads and the queue was left in its or
 
 There are at least three ways to deal with this problem in a way that would semantically make sense:
 
-1. Every node removed from the queue is kept in memory until there are no more references from any OFD's read-cursor to it. Read would go on as if the state of the queue was not changed, the words which are already removed form the queue would stay in memory until all OFD's that have started reading some of them, have finished reading all of them.
-2. A variation of 1., where only currently pointed at words are kept in memory after an OFD has finished reading an already dequeued word, its read-cursor would jump to the beginning of the first word of the queue.
-3. The cursor immediately jumps to the first word of the queue.
+1. `w ar`: The read continues as if nothing would have happened. Until the read is over, the words are still in memory. It is just the logger that has moved on.
+2. `w yo`: The read completes reading the word it last left, then jumps to the first word of the queue and continues from there.
+3. ` you`: The read immediately jumps to the first word of the queue
 
-For this implementation I went with 3. If an OFD already started reading a removed word, the next read will prepend a separator to mark the beginning of a new word.
+While all of those solutions seem reasonable. I decided to go with 3. There are at least three big advantages:
+- Less state tracking, less error prone
+- No awkward memory hogging by OFDs who refuse to go on reading
+- A more accurate representation of the *current* state of the queue.
+
 ```
 ? = " you"
 ```
 
-#### Resource exhaustion
+#### Resource limits
 
-- There is a limit to persistent memory. If it is reached write attempts return `-ENOSPC`. This deserves special note, as persistent is constantly released during logging events.
-- There is a possibility of [index exhaustion](#####indices-are-finite) when this occurs, also `-ENOSPC` is returned to `write()`.
+##### Persistent memory
+
+There is a limit to persistent memory, currently hard-coded as *1 MB* [(which is not fully accurate)](#memory-accounting). This is memory used by the queue itself and memory used to save per-OFD state.
+Only `write()` and `open()` can make the device claim more persistent memory. If they try to do so but no more memory is available. `-ENOSPC` is returned.
+
+##### Indices
+
+This is more of an implementation detail, but important to note: There is a [maximum number of words](#indices-are-finite), that can be enqueued throughout the lifetime of the module. Under normal operations this should never happen within our lifetime, but if it does, also `-ENOSPC` is returned by either `write()` or `open()`.
 
 ## Implementation
 
