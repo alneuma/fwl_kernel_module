@@ -963,7 +963,6 @@ static ssize_t fwl_read(struct file *filp, char __user *buf, size_t count,
 	ssize_t ret = 0;
 
 	(void)f_pos;
-
 	//pr_debug("called\n");
 
 	if (!count)
