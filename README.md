@@ -267,10 +267,20 @@ In most cases an OFD can just continue reading from the queue, where it left. `p
 ##### Indices are finite
 
 In the current implementation indices can not be repurposed. This means that there is the possibility of index exhaustion. The total amount words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one-second logging interval, once the device's memory limit has been reached. With a memory limit of *1 GB* and a very aggressive index claiming strategy, it would take around 135 years to get there. If this should ever happen `-ENOSPC` is returned.
+There is a book keeping implication: Per-OFD state keeps track of unfinished words which might be committed to the queue during `release()`. If we want to rule out the semantically awkward case in which a call to `close()` return `-ENOSPC`, OFDs need to reserve indices for their unfinished words. This happens with a counter, `node_idx_num_reserved`, that keeps track of the total amount of unfinished words held by all OFDs.
+
+An index needs to be reserved for each pending word, if we do not ever want to run into `close()` returning `-ENOSPC`.
+
 <details>
-<summary>If you should care</summary>
-The node of a one byte word occupies `33 bytes` of memory. With a memory limit of `1 GB` this amounts to a maximum of `32537631` words that can be enqueued at the same time. Lets assume all of those get enqueued immediately after the device is loaded. From then on new words can only be enqueued with a frequency of one per second. If we reserve one number as a sentinel, `u32` provides us with a pool of `2^32 - 1 = 4294967295` indices. So there are `4294967295 - 32537631 = 4262429666` seconds, or roughly `135` years left until index exhaustion. If anybody decides to make use of the device driver in this way `write()` will eventually return `-ENOSPC`.
-There is a book keeping implication: Because a pending word (`stash`) is enqueued when the OFD that owns it is released. An index needs to be reserved for each pending word, if we do not ever want to run into `close()` returning `-ENOSPC`.
+<summary>For whoever cares</summary>
+The most aggressive way to claim indices is by creating many small words.
+A node with a *1 byte* word occupies *33 bytes* of memory.
+Thus a memory limit of *1 GB* allows for *32537631* words.
+So right after the device is loaded *32537631* indices can be claimed immediately.
+After that a new one byte word can only be enqueued when another one is dequeued. This happens once a second.
+If we reserve one number as a sentinel, `u32` provides us with a pool of *2^32 - 1 = 4294967295* indices.
+So there are *4294967295 - 32537631 = 4262429666* seconds left during which one *1 byte* word per second needs to be enqueued until indices are exhausted.
+This is roughly *135* years.
 </details>
 
 ##### A different implementation strategy without `ptr`
