@@ -1,0 +1,31 @@
+debu@kdev-debian:~$ DIR=/home/debu/fwl_kernel_module/main_module/ &&
+> make -C $DIR > /dev/null &&
+> sudo insmod $DIR/fifo_word_logger.ko &&
+> sudo chmod 666 /dev/fifo_word_logger &&
+> echo "11 22 33 44 55 66 77 88 99 00" > /dev/fifo_word_logger &&
+> chunk_reader 4 3 /dev/fifo_word_logger &&
+> echo &&
+> echo "aa bb cc dd" > /dev/fifo_word_logger &&
+> sleep 5 &&
+> sudo rmmod fifo_word_logger &&
+> sudo dmesg -T | tail -18
+11 2 33 66 7 99
+[Tue Sep  8 11:23:39 2026] fwl: initializing fifo_word_logger ...
+[Tue Sep  8 11:23:39 2026] fwl: fifo_word_logger loaded successfully
+[Tue Sep  8 11:23:40 2026] fwl: 11
+[Tue Sep  8 11:23:41 2026] fwl: 22
+[Tue Sep  8 11:23:42 2026] fwl: 33
+[Tue Sep  8 11:23:43 2026] fwl: 44
+[Tue Sep  8 11:23:44 2026] fwl: 55
+[Tue Sep  8 11:23:45 2026] fwl: 66
+[Tue Sep  8 11:23:46 2026] fwl: 77
+[Tue Sep  8 11:23:47 2026] fwl: 88
+[Tue Sep  8 11:23:48 2026] fwl: 99
+[Tue Sep  8 11:23:49 2026] fwl: 00
+[Tue Sep  8 11:23:52 2026] fwl: aa
+[Tue Sep  8 11:23:53 2026] fwl: bb
+[Tue Sep  8 11:23:54 2026] fwl: cc
+[Tue Sep  8 11:23:55 2026] fwl: dd
+[Tue Sep  8 11:23:56 2026] fwl: cleaning up fifo_word_logger ...
+[Tue Sep  8 11:23:56 2026] fwl: fifo_word_logger removed successfully
+debu@kdev-debian:~$
