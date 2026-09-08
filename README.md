@@ -1,6 +1,22 @@
 # FWL - FIFO Word Logger
 *A dynamically loadable character device for the Linux kernel 6.12.105*
 
+<details>
+<summary>logs</summary>
+
+**simple writing, reading and logging**
+
+![logs for simple reading/writing](logs/log_read_write_simple.png)
+
+
+**periodic reading getting disrupted by logging**
+
+![logs for chunked reading](logs/log_read_chunked.png)
+
+(`chunk_reader` is a small C program, that does read from a file with specified write buffer sizes in specified intervals and prints the result to stdout.)
+
+</details>
+
 ## Overview
 
 Write words into the device, read them back, log them one by one. What could possibly go wrong?

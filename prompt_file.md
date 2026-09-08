@@ -9,17 +9,6 @@ I have written a README for one of my github projects. It is intended to lure in
 Write words into the device, read them back, log them one by one. What could possibly go wrong?
 FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words.
 
-## What I have learned
-
-I came into this with some background in user-space C and Linux, but had never touched the kernel. The hardest part wasn't learning the API or setting up the development environment, it was learning to reason about execution contexts, concurrency, ownership, and object lifetime. Questions like:
-
-- What happens when another execution context removes an object I am referencing?
-- How can a multi-stage operation fail without corrupting persistent state?
-- Which operations need to be mutually exclusive?
-- How should resource limits interact with object lifetime and error handling?
-
-are haunting me till this day.
-
 ## Why is this interesting?
 
 What sounds simple at the surface turns out to come with a lot of decisions concerning architecture and semantics:
@@ -324,6 +313,17 @@ I have not stress tested the module with multiple concurrent accesses.
 | Concurrent writes | Yes | No |
 | Concurrent read/write | Yes | No |
 | Multiple concurrent OFDs | Yes | No |
+
+## What I have learned
+
+I came into this with some background in user-space C and Linux, but had never touched the kernel. The hardest part wasn't learning the API or setting up the development environment, it was learning to reason about execution contexts, concurrency, ownership, and object lifetime. Questions like:
+
+- What happens when another execution context removes an object I am referencing?
+- How can a multi-stage operation fail without corrupting persistent state?
+- Which operations need to be mutually exclusive?
+- How should resource limits interact with object lifetime and error handling?
+
+are haunting me till this day.
 
 ## Possible refinements for future iterations
 
