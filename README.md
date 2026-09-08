@@ -6,6 +6,17 @@
 Write words into the device, read them back, log them one by one. What could possibly go wrong?
 FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words.
 
+## What I have learned
+
+I came into this with some background in user-space C and Linux, but had never touched the kernel. The hardest part wasn't learning the API or setting up the development environment, it was learning to reason about execution contexts, concurrency, ownership, and object lifetime. Questions like:
+
+- What happens when another execution context removes an object I am referencing?
+- How can a multi-stage operation fail without corrupting persistent state?
+- Which operations need to be mutually exclusive?
+- How should resource limits interact with object lifetime and error handling?
+
+are haunting me till this day.
+
 ## Why is this interesting?
 
 What sounds simple at the surface turns out to come with a lot of decisions concerning architecture and semantics:
@@ -20,24 +31,12 @@ How to manage resource limits?
 
 ## What this demonstrates
 
-- Linux kernel module development in C
-- Concurrent shared-state design
-- Per-OFD state management
-- Atomic changes to persistent state
-- Resource accounting and exhaustion handling
-- Asynchronous state changes through work queues
+- Designing concurrent shared-state in kernel-space
+- Maintaining per-OFD accross independent accesses
+- Make multi-stage writes commit atomically
+- Handling resource accounting partial failure
+- Coordinating synchronous operations with asynchronous mutation
 - Reasoning about object lifetime and stale references
-
-## What I have learned
-
-I came into this with some background in user-space C and Linux, but had never touched the kernel. The hardest part wasn't learning the API or setting up the development environment, it was learning to reason about execution contexts, concurrency, ownership, and object lifetime. Questions like:
-
-- What happens when another execution context removes an object I am referencing?
-- How can a multi-stage operation fail without corrupting persistent state?
-- Which operations need to be mutually exclusive?
-- How should resource limits interact with object lifetime and error handling?
-
-are haunting me till this day.
 
 ## Architecture overview
 
@@ -330,5 +329,3 @@ I have not stress tested the module with multiple concurrent accesses.
 > **Kernel:** Linux 6.12.105\
 > **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
 > **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation and testing
-
-Each open() creates an open file description (OFD), and the driver associates private state with that OFD via file->private_data. Multiple file descriptors may reference the same OFD after dup()/fork().
