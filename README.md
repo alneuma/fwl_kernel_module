@@ -26,13 +26,13 @@ FWL is a dynamically loadable Linux kernel character device that turns a byte st
 
 What sounds simple at the surface turns out to come with a lot of decisions concerning architecture and semantics:
 
-What happens when a write stops in the middle of a word?
-What happens when different reads/writes happen concurrently?
-What happens when different reads/writes of the same OFD (open file description) happen concurrently?
-What happens when an OFD reads and its last read ended within a word that now is dequeued?
-How to handle partially successful reads/writes?
-What happens under different failure conditions?
-How to manage resource limits?
+- What happens when a write stops in the middle of a word?
+- What happens when different reads/writes happen concurrently?
+- What happens when different reads/writes of the same OFD (open file description) happen concurrently?
+- What happens when an OFD reads and its last read ended within a word that now is dequeued?
+- How to handle partially successful reads/writes?
+- What happens under different failure conditions?
+- How to manage resource limits?
 
 ## What this demonstrates
 
