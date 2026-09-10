@@ -1,43 +1,101 @@
 # FWL - FIFO Word Logger
-*A dynamically loadable character device for the Linux kernel 6.12.105*
+![C](https://img.shields.io/badge/C-5C6D7E?style=flat-square&logo=c&logoColor=A8B9CC) ![Linux kernel 6.12.105](https://img.shields.io/badge/-Linux%20kernel%206.12.105-2C6BED?style=flat-square&logo=linux&logoColor=white) ![GPL-2.0-only](https://img.shields.io/badge/-GPL--2.0-4C8E4C?style=flat-square)
+
+![kernel](https://img.shields.io/badge/-kernel-6B6B6B?style=flat-square) ![concurrency](https://img.shields.io/badge/-concurrency-6B6B6B?style=flat-square) ![defined lock order](https://img.shields.io/badge/-defined%20lock%20order-6B6B6B?style=flat-square) ![per-OFD state](https://img.shields.io/badge/-per--OFD%20state-6B6B6B?style=flat-square) ![transactional state mutation](https://img.shields.io/badge/-transactional%20state%20mutation-6B6B6B?style=flat-square) ![resource accounting](https://img.shields.io/badge/-resource%20accounting-6B6B6B?style=flat-square) ![workqueues](https://img.shields.io/badge/-workqueues-6B6B6B?style=flat-square)
+
+> **What this is:** A dynamically loadable character device\
+> **Kernel:** Linux 6.12.105\
+> **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
+> **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation, and testing
+
+What looks deceptively simple at the surface turned into a hog of complexity, once taken seriously:
+Write words into the device, read them back, log them one by one. What could possibly go wrong?
 
 <details>
-<summary>logs</summary>
+<summary>Table of Contents</summary>
+
+- [How to run it?](#how-to-run-it)
+- [Repository Layout](#repository-layout)
+- [Why is this interesting?](#why-is-this-interesting)
+- [What this demonstrates](#what-this-demonstrates)
+- [Architecture overview](#architecture-overview)
+- [Semantics](#semantics)
+  - [Words](#words)
+    - [What is a word?](#what-is-a-word)
+    - [What if a word spans across multiple writes?](#what-if-a-word-spans-across-multiple-writes)
+    - [Stream construction for read() or "How does this look like?"](#stream-construction-for-read-or-how-does-this-look-like)
+    - [Logging](#logging)
+    - [The tricky part: How to make friends of logging and read()?](#the-tricky-part-how-to-make-friends-of-logging-and-read)
+    - [Resource limits](#resource-limits)
+- [Implementation](#implementation)
+  - [General locking scheme](#general-locking-scheme)
+  - [Custom types](#custom-types)
+  - [Transactions](#transactions)
+  - [Logging](#logging-1)
+    - [Two states](#two-states)
+  - [The read cursor and node indexing](#the-read-cursor-and-node-indexing)
+    - [Things to note about the cursor implementation](#things-to-note-about-the-cursor-implementation)
+  - [Memory accounting](#memory-accounting)
+- [Testing](#testing)
+    - [Overview of performed testing duties](#overview-of-performed-testing-duties)
+- [What I have learned](#what-i-have-learned)
+- [Possible refinements for future iterations](#possible-refinements-for-future-iterations)
+- [AI usage](#ai-usage)
+
+</details>
 
 **simple writing, reading, and logging**
 
 ![logs for simple reading/writing](logs/log_read_write_simple.png)
 
-
-**periodic reading getting disrupted by logging**
+<details>
+<summary>interleaved reading getting disrupted by logging</summary>
 
 ![logs for chunked reading](logs/log_read_chunked.png)
 
-(`chunk_reader` is a small C program that does read from a file with specified write buffer sizes in specified intervals and prints the result to stdout.)
+([chunk_reader](https://github.com/alneuma/chardev_test_utils) is a small C program that does read from a file with specified write buffer sizes in specified intervals and prints the result to stdout.)
 
 </details>
 
-## Overview
+## How to run it?
 
-Write words into the device, read them back, log them one by one. What could possibly go wrong?
-FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words.
+Fire up a VM loaded with Linux kernel version 6.12.105, then:
+
+```bash
+$ git clone https://github.com/alneuma/fwl_kernel_module.git
+$ make -C fwl_kernel_module/main_module
+$ sudo insmod fwl_kernel_module/main_module/fifo_word_logger.ko
+$ sudo chmod 666 /dev/fifo_word_logger
+$ echo "Your cool message!" > /dev/fifo_word_logger && cat /dev/fifo_word_logger
+$ sudo dmesg -Tw
+```
+
+## Repository Layout
+```text
+main_module/           the module itself: fifo_word_logger.c + Makefile
+experiments/           experiments I used to explore kernel concepts
+  word_lister/         word parsing + per-OFD state, no logging yet
+  periodic_logger/     delayed-work logging + timer-drift, no word queue yet
+kernel_build/          buildinfo of the custom 6.12.105 kernel used for testing
+logs/                  screenshots and textual logfiles
+```
 
 ## Why is this interesting?
 
 What sounds simple at the surface turns out to come with a lot of decisions concerning architecture and semantics:
 
-What happens when a write stops in the middle of a word?
-What happens when different reads/writes happen concurrently?
-What happens when different reads/writes of the same OFD (open file description) happen concurrently?
-What happens when an OFD reads and its last read ended within a word that now is dequeued?
-How to handle partially successful reads/writes?
-What happens under different failure conditions?
-How to manage resource limits?
+- What happens when a write stops in the middle of a word?
+- What happens when different reads/writes happen concurrently?
+- What happens when different reads/writes of the same OFD (open file description) happen concurrently?
+- What happens when an OFD reads and its last read ended within a word that now is dequeued?
+- How to handle partially successful reads/writes?
+- What happens under different failure conditions?
+- How to manage resource limits?
 
 ## What this demonstrates
 
 - Designing concurrent shared state in kernel-space
-- Maintaining per-OFD across independent accesses
+- Maintaining per-OFD state across independent accesses
 - Making multi-stage writes commit atomically
 - Handling resource accounting
 - Handling partial failures of read() and write()
@@ -205,7 +263,7 @@ Not taking into account data, that is exclusively used by `fwl_init()` and `fwl_
 | `node_idx_counter` | counter kept for indexing queue nodes |
 | `node_idx_num_reserved` | number of reserved queue node indices |
 
-### custom types
+### Custom types
 
 | name | function |
 |-|-|
@@ -248,7 +306,7 @@ When the queue is non-empty a work item is already scheduled or about to be sche
 
 ##### transitions
 
-Every transition from `queue empty` to `queue non-empty` happens atomically and is fully controlled by `write()` and `release()`. The atomicity ensures that no scheduling contest happens.
+Every transition from `queue empty` to `queue non-empty` happens atomically and is fully controlled by `write()` and `release()`. The atomicity ensures that no scheduling contention happens.
 
 Every transition from `queue non-empty` to `queue empty` also happens atomically and is fully controlled by the callback.
 
@@ -272,13 +330,14 @@ In most cases an OFD can just continue reading from the queue, where it left. `p
 
 ##### Indices are finite
 
-In the current implementation indices cannot be repurposed. This means that there is the possibility of index exhaustion. The total number words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one-second logging interval, once the device's memory limit has been reached. With a memory limit of *1 GB* and a very aggressive index claiming strategy, it would take around 135 years to get there. If this should ever happen `-ENOSPC` is returned (Note: the currently hard-coded memory limit is *1 MB*).
+In the current implementation indices cannot be repurposed. This means that there is the possibility of index exhaustion. The total number words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one-second logging interval, once the device's memory limit has been reached. Even if for the sake of the argument we assume a memory limit of *1 GB* instead of *1 MB* and then add a very aggressive index claiming strategy, it would take around 135 years to get there. If this should ever happen `-ENOSPC` is returned.
 There is a bookkeeping implication: Per-OFD state keeps track of unfinished words which might be committed to the queue during `release()`. If we want to rule out the semantically awkward case in which a call to `close()` returns `-ENOSPC`, OFDs need to reserve indices for their unfinished words. This happens with a counter, `node_idx_num_reserved`, that keeps track of the total amount of unfinished words held by all OFDs.
 
 An index needs to be reserved for each pending word if we do not ever want to run into `close()` returning `-ENOSPC`.
 
 <details>
 <summary>For whoever cares</summary>
+
 The most aggressive way to claim indices is by creating many small words.
 A node with a *1 byte* word occupies *33 bytes* of memory.
 Thus a memory limit of *1 GB* allows for *32537631* words.
@@ -287,6 +346,7 @@ After that a new one byte word can only be enqueued when another one is dequeued
 If we reserve one number as a sentinel, `u32` provides us with a pool of *2^32 - 1 = 4294967295* indices.
 So there are *4294967295 - 32537631 = 4262429666* seconds left during which one *1 byte* word per second needs to be enqueued until indices are exhausted.
 This is roughly *135* years.
+
 </details>
 
 ##### A different implementation strategy without `ptr`
@@ -305,21 +365,21 @@ I mainly tested manually by modifying compile-time constants like resource limit
 
 These programs are:
 
-`chunk_writer`: takes an input string and writes it to stdout with a fixed write buffer size that is provided as a command line argument. Used for testing correct word parsing.
-`chunk_reader`: reads with fixed buffer sizes from a file and prints to stdout. The buffer size, as well as a delay between reads can be passed as command line arguments. This was most helpful when testing the read() during synchronous modification of the word queue by the logging mechanism.
+[chunk_writer](https://github.com/alneuma/chardev_test_utils): takes an input string and writes it to stdout with a fixed write buffer size that is provided as a command line argument. Used for testing correct word parsing.
+[chunk_reader](https://github.com/alneuma/chardev_test_utils): reads with fixed buffer sizes from a file and prints to stdout. The buffer size, as well as a delay between reads can be passed as command line arguments. This was most helpful when testing the read() during synchronous modification of the word queue by the logging mechanism.
 
-KSAN, KMEMLEAK and KLOCKDEP did substantial work 
+KASAN, kmemleak and lockdep offered some help as well.
 
 I have not stress tested the module with multiple concurrent accesses.
 
-## Overview of performed testing duties
+### Overview of performed testing duties
 
 | Area | Designed for | Tested |
 |-|-|-|
 | per-OFD managed partial words across writes | Yes | Yes |
 | Small read()/write() buffers | Yes | Yes |
 | Very large read()/write() buffer | Yes | Yes |
-| Queue mutation inbetween reads | Yes | Yes |
+| Queue mutation in between reads | Yes | Yes |
 | Resource exhaustion | Partially | Yes |
 | Allocation failures | Yes | Partially |
 | Concurrent reads | Yes | No |
@@ -347,7 +407,7 @@ are haunting me to this day.
     - logging interval
     - memory limit
 - rework memory management
-- implemening poll() and blocking behavior when appropriate
+- implementing poll() and blocking behavior when appropriate
 - more systematic documentation of invariants and concurrency arguments
 
 ## AI usage
@@ -356,7 +416,3 @@ are haunting me to this day.
 - clarifying unfamiliar APIs/concepts
 - reviewing already-written code
 - exploring potential failure cases
-
-> **Kernel:** Linux 6.12.105\
-> **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
-> **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation, and testing
