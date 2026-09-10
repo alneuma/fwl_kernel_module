@@ -1,12 +1,10 @@
 # FWL - FIFO Word Logger
-*kernel, concurrency, per-OFD state, transactional state mutations, resource exhaustion, workqueues, Linux*
+*C, concurrency, per-OFD state, transactional state mutation, resource exhaustion, workqueues, Linux kernel 6.12.105, GPL-2.0*
 
 > **What this is:** A dynamically loadable character device\
 > **Kernel:** Linux 6.12.105\
 > **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
 > **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation, and testing
-
-</details>
 
 What looks deceptively simple at the surface turned into a hog of complexity, once taken seriously:
 Write words into the device, read them back, log them one by one. What could possibly go wrong?
@@ -65,7 +63,7 @@ $ git clone https://github.com/alneuma/fwl_kernel_module.git
 $ make -C fwl_kernel_module/main_module
 $ sudo insmod fwl_kernel_module/main_module/fifo_word_logger.ko
 $ sudo chmod 666 /dev/fifo_word_logger
-$ echo "Your cool message!" > /dev/fifo_word_logger && sleep 1.5 && cat /dev/fifo_word_logger
+$ echo "Your cool message!" > /dev/fifo_word_logger && cat /dev/fifo_word_logger
 $ sudo dmesg -Tw
 ```
 
@@ -357,7 +355,7 @@ These programs are:
 `chunk_writer`: takes an input string and writes it to stdout with a fixed write buffer size that is provided as a command line argument. Used for testing correct word parsing.
 `chunk_reader`: reads with fixed buffer sizes from a file and prints to stdout. The buffer size, as well as a delay between reads can be passed as command line arguments. This was most helpful when testing the read() during synchronous modification of the word queue by the logging mechanism.
 
-KASAN, kmemleak and lockdep did substantial work 
+KASAN, kmemleak and lockdep offered some help as well.
 
 I have not stress tested the module with multiple concurrent accesses.
 
@@ -368,7 +366,7 @@ I have not stress tested the module with multiple concurrent accesses.
 | per-OFD managed partial words across writes | Yes | Yes |
 | Small read()/write() buffers | Yes | Yes |
 | Very large read()/write() buffer | Yes | Yes |
-| Queue mutation inbetwen reads | Yes | Yes |
+| Queue mutation inbetween reads | Yes | Yes |
 | Resource exhaustion | Partially | Yes |
 | Allocation failures | Yes | Partially |
 | Concurrent reads | Yes | No |
