@@ -13,6 +13,7 @@ Write words into the device, read them back, log them one by one. What could pos
 <summary>Table of Contents</summary>
 
 - [How to run it?](#how-to-run-it)
+- [Repository Layout](#repository-layout)
 - [Why is this interesting?](#why-is-this-interesting)
 - [What this demonstrates](#what-this-demonstrates)
 - [Architecture overview](#architecture-overview)
@@ -50,7 +51,7 @@ Write words into the device, read them back, log them one by one. What could pos
 
 ![logs for chunked reading](logs/log_read_chunked.png)
 
-(`chunk_reader` is a small C program that does read from a file with specified write buffer sizes in specified intervals and prints the result to stdout.)
+([chunk_reader](https://github.com/alneuma/chardev_test_utils) is a small C program that does read from a file with specified write buffer sizes in specified intervals and prints the result to stdout.)
 
 </details>
 
@@ -65,6 +66,16 @@ $ sudo insmod fwl_kernel_module/main_module/fifo_word_logger.ko
 $ sudo chmod 666 /dev/fifo_word_logger
 $ echo "Your cool message!" > /dev/fifo_word_logger && cat /dev/fifo_word_logger
 $ sudo dmesg -Tw
+```
+
+## Repository Layout
+```text
+main_module/           the module itself: fifo_word_logger.c + Makefile
+experiments/           experiments I used to explore kernel concepts
+  word_lister/         word parsing + per-OFD state, no logging yet
+  periodic_logger/     delayed-work logging + timer-drift, no word queue yet
+kernel_build/          buildinfo of the custom 6.12.105 kernel used for testing
+logs/                  screenshots and textual logfiles
 ```
 
 ## Why is this interesting?
@@ -352,8 +363,8 @@ I mainly tested manually by modifying compile-time constants like resource limit
 
 These programs are:
 
-`chunk_writer`: takes an input string and writes it to stdout with a fixed write buffer size that is provided as a command line argument. Used for testing correct word parsing.
-`chunk_reader`: reads with fixed buffer sizes from a file and prints to stdout. The buffer size, as well as a delay between reads can be passed as command line arguments. This was most helpful when testing the read() during synchronous modification of the word queue by the logging mechanism.
+[chunk_writer](https://github.com/alneuma/chardev_test_utils): takes an input string and writes it to stdout with a fixed write buffer size that is provided as a command line argument. Used for testing correct word parsing.
+[chunk_reader](https://github.com/alneuma/chardev_test_utils): reads with fixed buffer sizes from a file and prints to stdout. The buffer size, as well as a delay between reads can be passed as command line arguments. This was most helpful when testing the read() during synchronous modification of the word queue by the logging mechanism.
 
 KASAN, kmemleak and lockdep offered some help as well.
 
