@@ -1,17 +1,47 @@
 # FWL - FIFO Word Logger
 *kernel, concurrency, per-OFD state, transactional state mutations, resource exhaustion, workqueues, Linux*
 
-<details>
-<summary>A dynamically loadable character device for the Linux kernel 6.12.105</summary>
-
+> **What this is:** A dynamically loadable character device\
 > **Kernel:** Linux 6.12.105\
 > **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
 > **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation, and testing
 
 </details>
 
-What looks desceptiveley simple at the surface turned int a hog of complexity, once taken seriously:
+What looks deceptively simple at the surface turned into a hog of complexity, once taken seriously:
 Write words into the device, read them back, log them one by one. What could possibly go wrong?
+
+<details>
+<summary>Table of Contents</summary>
+
+- [How to run it?](#how-to-run-it)
+- [Why is this interesting?](#why-is-this-interesting)
+- [What this demonstrates](#what-this-demonstrates)
+- [Architecture overview](#architecture-overview)
+- [Semantics](#semantics)
+  - [Words](#words)
+    - [What is a word?](#what-is-a-word)
+    - [What if a word spans across multiple writes?](#what-if-a-word-spans-across-multiple-writes)
+    - [Stream construction for read() or "How does this look like?"](#stream-construction-for-read-or-how-does-this-look-like)
+    - [Logging](#logging)
+    - [The tricky part: How to make friends of logging and read()?](#the-tricky-part-how-to-make-friends-of-logging-and-read)
+    - [Resource limits](#resource-limits)
+- [Implementation](#implementation)
+  - [General locking scheme](#general-locking-scheme)
+  - [Custom types](#custom-types)
+  - [Transactions](#transactions)
+  - [Logging](#logging-1)
+    - [Two states](#two-states)
+  - [The read cursor and node indexing](#the-read-cursor-and-node-indexing)
+    - [Things to note about the cursor implementation](#things-to-note-about-the-cursor-implementation)
+  - [Memory accounting](#memory-accounting)
+- [Testing](#testing)
+    - [Overview of performed testing duties](#overview-of-performed-testing-duties)
+- [What I have learned](#what-i-have-learned)
+- [Possible refinements for future iterations](#possible-refinements-for-future-iterations)
+- [AI usage](#ai-usage)
+
+</details>
 
 **simple writing, reading, and logging**
 
@@ -31,11 +61,11 @@ Write words into the device, read them back, log them one by one. What could pos
 Fire up a VM loaded with Linux kernel version 6.12.105, then:
 
 ```bash
-$ git clone git@github.com:alneuma/fwl_kernel_module.git
+$ git clone https://github.com/alneuma/fwl_kernel_module.git
 $ make -C fwl_kernel_module/main_module
 $ sudo insmod fwl_kernel_module/main_module/fifo_word_logger.ko
-$ sudo chmod 666 /dev/fifo_kernel_module
-$ echo "Your cool message!" > /dev/fifo_word_logger && cat /dev/fifo_word_logger
+$ sudo chmod 666 /dev/fifo_word_logger
+$ echo "Your cool message!" > /dev/fifo_word_logger && sleep 1.5 && cat /dev/fifo_word_logger
 $ sudo dmesg -Tw
 ```
 
@@ -222,7 +252,7 @@ Not taking into account data, that is exclusively used by `fwl_init()` and `fwl_
 | `node_idx_counter` | counter kept for indexing queue nodes |
 | `node_idx_num_reserved` | number of reserved queue node indices |
 
-### custom types
+### Custom types
 
 | name | function |
 |-|-|
@@ -265,7 +295,7 @@ When the queue is non-empty a work item is already scheduled or about to be sche
 
 ##### transitions
 
-Every transition from `queue empty` to `queue non-empty` happens atomically and is fully controlled by `write()` and `release()`. The atomicity ensures that no scheduling contest happens.
+Every transition from `queue empty` to `queue non-empty` happens atomically and is fully controlled by `write()` and `release()`. The atomicity ensures that no scheduling contention happens.
 
 Every transition from `queue non-empty` to `queue empty` also happens atomically and is fully controlled by the callback.
 
@@ -327,18 +357,18 @@ These programs are:
 `chunk_writer`: takes an input string and writes it to stdout with a fixed write buffer size that is provided as a command line argument. Used for testing correct word parsing.
 `chunk_reader`: reads with fixed buffer sizes from a file and prints to stdout. The buffer size, as well as a delay between reads can be passed as command line arguments. This was most helpful when testing the read() during synchronous modification of the word queue by the logging mechanism.
 
-KSAN, KMEMLEAK and KLOCKDEP did substantial work 
+KASAN, kmemleak and lockdep did substantial work 
 
 I have not stress tested the module with multiple concurrent accesses.
 
-## Overview of performed testing duties
+### Overview of performed testing duties
 
 | Area | Designed for | Tested |
 |-|-|-|
 | per-OFD managed partial words across writes | Yes | Yes |
 | Small read()/write() buffers | Yes | Yes |
 | Very large read()/write() buffer | Yes | Yes |
-| Queue mutation inbetween reads | Yes | Yes |
+| Queue mutation inbetwen reads | Yes | Yes |
 | Resource exhaustion | Partially | Yes |
 | Allocation failures | Yes | Partially |
 | Concurrent reads | Yes | No |
@@ -366,7 +396,7 @@ are haunting me to this day.
     - logging interval
     - memory limit
 - rework memory management
-- implemening poll() and blocking behavior when appropriate
+- implementing poll() and blocking behavior when appropriate
 - more systematic documentation of invariants and concurrency arguments
 
 ## AI usage
