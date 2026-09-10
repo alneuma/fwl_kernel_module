@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0
+
 /*
  * fifo_word_logger
  *
@@ -236,7 +238,7 @@ static bool fwl_consume_first_word(struct list_head *words)
 	up_write(&rw_sem_logging);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
-	pr_info("%.*s\n", e->idx, len, e->word);
+	pr_info("%.*s\n", len, e->word);
 	kfree(e);
 
 	return keep_going;
