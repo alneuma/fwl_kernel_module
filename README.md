@@ -1,15 +1,24 @@
 # FWL - FIFO Word Logger
-*A dynamically loadable character device for the Linux kernel 6.12.105*
+*kernel, concurrency, per-OFD state, transactional state mutations, resource exhaustion, workqueues, Linux*
 
 <details>
-<summary>logs</summary>
+<summary>A dynamically loadable character device for the Linux kernel 6.12.105</summary>
+
+> **Kernel:** Linux 6.12.105\
+> **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
+> **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation, and testing
+
+</details>
+
+What looks desceptiveley simple at the surface turned int a hog of complexity, once taken seriously:
+Write words into the device, read them back, log them one by one. What could possibly go wrong?
 
 **simple writing, reading, and logging**
 
 ![logs for simple reading/writing](logs/log_read_write_simple.png)
 
-
-**periodic reading getting disrupted by logging**
+<details>
+<summary>interleaved reading getting disrupted by logging</summary>
 
 ![logs for chunked reading](logs/log_read_chunked.png)
 
@@ -17,10 +26,18 @@
 
 </details>
 
-## Overview
+## How to run it?
 
-Write words into the device, read them back, log them one by one. What could possibly go wrong?
-FWL is a dynamically loadable Linux kernel character device that turns a byte stream into a FIFO queue of words.
+Fire up a VM loaded with Linux kernel version 6.12.105, then:
+
+```bash
+$ git clone git@github.com:alneuma/fwl_kernel_module.git
+$ make -C fwl_kernel_module/main_module
+$ sudo insmod fwl_kernel_module/main_module/fifo_word_logger.ko
+$ sudo chmod 666 /dev/fifo_kernel_module
+$ echo "Your cool message!" > /dev/fifo_word_logger && cat /dev/fifo_word_logger
+$ sudo dmesg -Tw
+```
 
 ## Why is this interesting?
 
@@ -272,13 +289,14 @@ In most cases an OFD can just continue reading from the queue, where it left. `p
 
 ##### Indices are finite
 
-In the current implementation indices cannot be repurposed. This means that there is the possibility of index exhaustion. The total number words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one-second logging interval, once the device's memory limit has been reached. With a memory limit of *1 GB* and a very aggressive index claiming strategy, it would take around 135 years to get there. If this should ever happen `-ENOSPC` is returned (Note: the currently hard-coded memory limit is *1 MB*).
+In the current implementation indices cannot be repurposed. This means that there is the possibility of index exhaustion. The total number words that can be enqueued during the lifetime of the device is capped. In practice this should never happen, as the frequency with which words can be enqueued is capped by the one-second logging interval, once the device's memory limit has been reached. Even if for the sake of the argument we assume a memory limit of *1 GB* instead of *1 MB* and then add a very aggressive index claiming strategy, it would take around 135 years to get there. If this should ever happen `-ENOSPC` is returned.
 There is a bookkeeping implication: Per-OFD state keeps track of unfinished words which might be committed to the queue during `release()`. If we want to rule out the semantically awkward case in which a call to `close()` returns `-ENOSPC`, OFDs need to reserve indices for their unfinished words. This happens with a counter, `node_idx_num_reserved`, that keeps track of the total amount of unfinished words held by all OFDs.
 
 An index needs to be reserved for each pending word if we do not ever want to run into `close()` returning `-ENOSPC`.
 
 <details>
 <summary>For whoever cares</summary>
+
 The most aggressive way to claim indices is by creating many small words.
 A node with a *1 byte* word occupies *33 bytes* of memory.
 Thus a memory limit of *1 GB* allows for *32537631* words.
@@ -287,6 +305,7 @@ After that a new one byte word can only be enqueued when another one is dequeued
 If we reserve one number as a sentinel, `u32` provides us with a pool of *2^32 - 1 = 4294967295* indices.
 So there are *4294967295 - 32537631 = 4262429666* seconds left during which one *1 byte* word per second needs to be enqueued until indices are exhausted.
 This is roughly *135* years.
+
 </details>
 
 ##### A different implementation strategy without `ptr`
@@ -356,7 +375,3 @@ are haunting me to this day.
 - clarifying unfamiliar APIs/concepts
 - reviewing already-written code
 - exploring potential failure cases
-
-> **Kernel:** Linux 6.12.105\
-> **Environment:** Debian 13 VM, freshly compiled kernel with debugging features enabled\
-> **Development time:** ~2.5 weeks, including kernel/toolchain setup, research, implementation, and testing
