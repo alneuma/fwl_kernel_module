@@ -93,7 +93,7 @@ What sounds simple at the surface turns out to come with a lot of decisions conc
 ## What this demonstrates
 
 - Designing concurrent shared state in kernel-space
-- Maintaining per-OFD across independent accesses
+- Maintaining per-OFD state across independent accesses
 - Making multi-stage writes commit atomically
 - Handling resource accounting
 - Handling partial failures of read() and write()
@@ -377,7 +377,7 @@ I have not stress tested the module with multiple concurrent accesses.
 | per-OFD managed partial words across writes | Yes | Yes |
 | Small read()/write() buffers | Yes | Yes |
 | Very large read()/write() buffer | Yes | Yes |
-| Queue mutation inbetween reads | Yes | Yes |
+| Queue mutation in between reads | Yes | Yes |
 | Resource exhaustion | Partially | Yes |
 | Allocation failures | Yes | Partially |
 | Concurrent reads | Yes | No |
