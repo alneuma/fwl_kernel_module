@@ -247,7 +247,7 @@ static bool fwl_consume_first_word(struct list_head *words)
 	up_write(&rw_sem_logging);
 
 	len = (int)min(e->len, (size_t)INT_MAX);
-	pr_info("log %u: %.*s\n", e->idx, len, e->word);
+	pr_info("log %u: %.*s\n", len, e->word);
 	kfree(e);
 
 	return keep_going;
